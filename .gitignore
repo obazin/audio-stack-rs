@@ -1,2 +1,7 @@
 /target
 Cargo.lock.orig
+
+# Dev-shell artifacts (rust-projects flake): the per-project CARGO_HOME and the
+# rust-toolchain.toml symlink the shell materializes into the nix store.
+/.cargo/
+/rust-toolchain.toml

@@ -27,6 +27,7 @@ mod events;
 mod loudness;
 mod metadata;
 mod nowplaying;
+#[cfg(feature = "opus")]
 mod opus;
 mod output;
 mod params;

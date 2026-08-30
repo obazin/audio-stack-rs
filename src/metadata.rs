@@ -15,10 +15,14 @@ use std::path::Path;
 use crate::loudness;
 
 /// Extensions the scanner picks up. This list tracks what the engine can
-/// decode, not what any browser accepts.
+/// decode, not what any browser accepts — so `.opus` is present only when the
+/// `opus` feature is on. (`.ogg` stays either way: it also carries Vorbis.)
+#[cfg(feature = "opus")]
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aif", "aiff",
 ];
+#[cfg(not(feature = "opus"))]
+pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "aac", "ogg", "aif", "aiff"];
 
 /// Container formats that are always lossless. `m4a` is deliberately absent:
 /// it can hold either AAC (lossy) or ALAC (lossless) and we don't inspect the

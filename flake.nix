@@ -23,8 +23,9 @@
         # alsa-lib + pkg-config: cpal's Linux backend links ALSA through
         # pkg-config. macOS reaches CoreAudio through the SDK and needs
         # nothing here.
-        nativeDeps = [ pkgs.cmake ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
-        buildDeps = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
+        nativeDeps =
+          [ pkgs.cmake ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.pkg-config ];
+        buildDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.alsa-lib ];
       in
       lib.mkRustProject {
         name = "audio-stack-rs";

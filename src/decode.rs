@@ -332,6 +332,7 @@ mod tests {
     ///   ffmpeg -f lavfi -i "sine=frequency=440:duration=3:sample_rate=48000" \
     ///          -ac 1 -c:a libopus -b:a 64k /tmp/janis-opus/mono.opus
     /// Then: cargo test -- --ignored decodes_a_real_opus_file --nocapture
+    #[cfg(feature = "opus")]
     #[test]
     #[ignore = "requires an Opus fixture generated with ffmpeg"]
     fn decodes_a_real_opus_file() {

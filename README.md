@@ -26,8 +26,16 @@ audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1
 
 ### Build requirements
 
-- A C toolchain and **CMake** — libopus is built from source via `opusic-sys`.
+- A C toolchain and **CMake** — only for the default `opus` feature, which builds libopus from source via `opusic-sys`. Building with `--no-default-features` drops both the requirement and `.opus` playback (see [Feature flags](#feature-flags)).
 - On **Linux**, the **ALSA** development headers (`libasound2-dev` / `alsa-lib`) for cpal's backend. macOS reaches CoreAudio through the SDK and needs nothing extra.
+
+### Feature flags
+
+- **`opus`** *(default)* — the libopus-backed Opus decoder, so `.opus` files play and appear in `AUDIO_EXTENSIONS`. It is the only thing that pulls in `opusic-sys`/CMake, so `--no-default-features` gives a pure-Rust build that still decodes every other format. Depend on it that way with:
+
+  ```toml
+  audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", default-features = false }
+  ```
 
 ## Usage
 

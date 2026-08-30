@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["audio", "playback", "cpal", "symphonia", "radio"]
 categories = ["multimedia::audio"]
 
+[features]
+default = ["opus"]
+# Opus playback. Off `--no-default-features` builds decode every other format
+# but skip `.opus`, and — because `opusic-sys` is what drags in the libopus
+# C build — no longer need cmake or a C toolchain (see the README build
+# requirements). On by default so the out-of-the-box stack plays everything.
+opus = ["dep:opus", "dep:symphonia-common"]
+
 [dependencies]
 # ── Output + decode + DSP ────────────────────────────────────────────────────
 # Cross-platform device I/O: CoreAudio, WASAPI, ALSA. Owns the realtime
@@ -49,9 +57,10 @@ ebur128 = "0.1"
 # Opus. Symphonia 0.6 has no Opus decoder, so `opus.rs` wraps libopus as one.
 # `opusic-sys` builds libopus from bundled source with cmake. `symphonia-common`
 # is not re-exported by the `symphonia` facade but carries the OpusHead parser,
-# pinned to the same version so the two cannot drift apart.
-opus = "0.4"
-symphonia-common = "0.6.1"
+# pinned to the same version so the two cannot drift apart. Both are optional
+# and pulled in only by the `opus` feature.
+opus = { version = "0.4", optional = true }
+symphonia-common = { version = "0.6.1", optional = true }
 
 # ── Web radio ────────────────────────────────────────────────────────────────
 # Buffers an HTTP stream into something `Read + Seek`, which is what Symphonia
