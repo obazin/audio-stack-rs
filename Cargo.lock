@@ -31,6 +31,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -63,6 +72,7 @@ dependencies = [
  "stream-download",
  "symphonia",
  "symphonia-common",
+ "timestretch",
  "tokio",
 ]
 
@@ -2094,6 +2104,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "timestretch"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cc34a6abf29179a470946c85eda25025841c63e7af08873296661e8b845462d"
+dependencies = [
+ "arc-swap",
+ "ebur128",
+ "rustfft",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

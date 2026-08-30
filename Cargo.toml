@@ -17,6 +17,17 @@ default = ["opus"]
 # C build — no longer need cmake or a C toolchain (see the README build
 # requirements). On by default so the out-of-the-box stack plays everything.
 opus = ["dep:opus", "dep:symphonia-common"]
+# Time-stretch: a tempo effect (pitch preserved) in the decode-thread effect
+# chain, toggled and adjusted live via `AudioEngine::set_time_stretch`. Opt-in
+# because it pulls in the pre-1.0 `timestretch` engine (pinned exactly); pure
+# Rust, so it does not bring back the C toolchain the `opus` split removed.
+stretch = ["dep:timestretch"]
+
+# Audible time-stretch walkthrough: synthesizes a copyright-free clip and
+# steps the tempo live. `cargo run --example time_stretch --features stretch`.
+[[example]]
+name = "time_stretch"
+required-features = ["stretch"]
 
 [dependencies]
 # ── Output + decode + DSP ────────────────────────────────────────────────────
@@ -61,6 +72,9 @@ ebur128 = "0.1"
 # and pulled in only by the `opus` feature.
 opus = { version = "0.4", optional = true }
 symphonia-common = { version = "0.6.1", optional = true }
+# The time-stretch backend: pure-Rust real-time tempo engine (Keylock keeps
+# pitch). Pinned to the exact version — it is pre-1.0 and its API moves fast.
+timestretch = { version = "=0.14.0", optional = true }
 
 # ── Web radio ────────────────────────────────────────────────────────────────
 # Buffers an HTTP stream into something `Read + Seek`, which is what Symphonia

@@ -10,6 +10,7 @@ It was extracted from the [Janis](https://github.com/obazin/janis) desktop playe
 - **Gapless, crossfade, or a deliberate gap** — track joins happen in-ring for true gapless play, or overlap with an equal-power crossfade, or flush to a clean brief silence — your choice at runtime.
 - **Volume normalization** — EBU R128 ([ebur128](https://crates.io/crates/ebur128)) measured while a track plays, or ReplayGain tags where present. You provide a `Store` for persistence; the library fills the answer in as tracks are heard.
 - **Web radio** — an HTTP stream buffered into the same decode path as a local file, with automatic reconnect/backoff, Icecast/Shoutcast ICY titles, and pluggable now-playing providers (SomaFM, Radio France, Radio Paradise) whose cover art is fetched over an https host allowlist.
+- **Time-stretch** *(opt-in `stretch` feature)* — live tempo control (0.25×–2×) with pitch preserved, toggled and adjusted during playback without a click via an effect chain in the decode path. The playhead stays correct while stretched.
 - **Live analyser** — a compact 170-byte visual frame (160 waveform points + 10 spectrum bands) pushed at ~60 Hz.
 - **Metadata parsing** — tag, audio-property, and embedded-cover reading via [lofty](https://crates.io/crates/lofty), plus filename-based track-number recovery. Pure functions returning plain data; you own the database.
 
@@ -36,6 +37,14 @@ audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1
   ```toml
   audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", default-features = false }
   ```
+
+- **`stretch`** *(opt-in)* — live time-stretch via `AudioEngine::set_time_stretch`: tempo 0.25×–2× with pitch preserved, adjustable during playback. Pure Rust (the [timestretch](https://crates.io/crates/timestretch) engine, pinned exactly), so it adds no C-toolchain requirement:
+
+  ```toml
+  audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", features = ["stretch"] }
+  ```
+
+  Hear it without writing a host: `cargo run --example time_stretch --features stretch` synthesizes a copyright-free clip and steps the tempo live through your speakers.
 
 ## Usage
 
@@ -89,7 +98,7 @@ let meta  = audio_stack_rs::read_metadata(std::path::Path::new("/music/track.fla
 let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>, base64 data URL parts
 ```
 
-`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
+`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
 
 ## Architecture notes
 
@@ -100,7 +109,7 @@ let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>
 ## Development
 
 ```sh
-cargo test                                   # 145 unit tests (5 device/network tests are #[ignore]d)
+cargo test                                   # 162 unit tests (175 with --features stretch); device/network tests are #[ignore]d
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

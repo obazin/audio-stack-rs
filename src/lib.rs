@@ -19,6 +19,7 @@
 //!   [`AudioEngine::play_stream`], is driven by the caller's runtime.
 
 mod analyser;
+mod chain;
 mod codecs;
 mod decode;
 mod dsp;
@@ -34,6 +35,8 @@ mod params;
 mod queue;
 mod resample;
 mod stream;
+#[cfg(feature = "stretch")]
+mod stretch;
 
 mod icy;
 
@@ -178,6 +181,17 @@ impl AudioEngine {
     }
     pub fn set_device(&self, device_id: Option<String>) {
         let _ = self.send(EngineCommand::SetDevice(device_id));
+    }
+
+    /// Enables/disables time-stretch and sets the tempo ratio (1.0 = normal,
+    /// 2.0 = double speed, clamped 0.25–2.0). Pitch is unaffected. A change
+    /// is heard once the audio already buffered ahead has played — up to
+    /// about half a second. Disabling ramps back to normal speed click-free;
+    /// the effect leaves the signal path entirely at the next track change
+    /// or seek. Echoed as [`EngineEvent::TimeStretch`].
+    #[cfg(feature = "stretch")]
+    pub fn set_time_stretch(&self, enabled: bool, ratio: f32) {
+        let _ = self.send(EngineCommand::SetTimeStretch { enabled, ratio });
     }
 
     /// Re-emit everything the host needs to render current state. Call after a

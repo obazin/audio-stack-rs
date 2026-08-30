@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use super::analyser::{Analyser, FRAME_BYTES};
+use super::chain::Chain;
 use super::decode::Decoder;
 use super::dsp::remap_channels;
 use super::events::{EngineEvent, Mode};
@@ -85,6 +86,14 @@ pub enum EngineCommand {
     /// `CROSSFADE_SECS`. Takes priority over `SetGapless` when both apply.
     SetCrossfade(bool),
     SetDevice(Option<String>),
+    /// Enables/disables the time-stretch effect and sets its tempo ratio
+    /// (1.0 = normal speed). Pitch is unaffected; the ratio is clamped to
+    /// the range the effect supports.
+    #[cfg(feature = "stretch")]
+    SetTimeStretch {
+        enabled: bool,
+        ratio: f32,
+    },
     /// A now-playing poller reporting what a station is playing. Carries the
     /// epoch it started under so a late answer about a station the listener
     /// has already left is discarded.
@@ -141,6 +150,9 @@ struct Boundary {
 struct Transition {
     decoder: Decoder,
     resampler: Option<Resampler>,
+    /// The incoming track's own effect chain, mirroring the outgoing one's
+    /// settings, adopted wholesale by `complete_transition`.
+    chain: Chain,
     entry: QueueEntry,
     /// Where the queue cursor was before this transition advanced it —
     /// restored by `cancel_transition` if something supersedes the fade.
@@ -210,6 +222,9 @@ pub struct Engine {
     has_provider: bool,
     station_epoch: Arc<AtomicU64>,
     resampler: Option<Resampler>,
+    /// The effect chain between the resampler and the ring. Empty (and
+    /// byte-transparent) until an effect is switched on.
+    chain: Chain,
 
     /// Whether a track boundary joins in-ring (no flush) or flushes to a
     /// deliberate gap. Toggled by the Settings switch of the same name.
@@ -279,6 +294,7 @@ impl Engine {
             has_provider: false,
             station_epoch,
             resampler: None,
+            chain: Chain::new(),
             gapless: true,
             crossfade: true,
             transition: None,
@@ -439,6 +455,26 @@ impl Engine {
                     self.cancel_transition();
                 }
             }
+            #[cfg(feature = "stretch")]
+            EngineCommand::SetTimeStretch { enabled, ratio } => {
+                if !ratio.is_finite() {
+                    return;
+                }
+                let (min, max) = super::stretch::TEMPO_RATIO_RANGE;
+                let ratio = ratio.clamp(min, max);
+                if let Err(message) = self.chain.set_time_stretch(enabled, ratio) {
+                    self.emit(EngineEvent::Error { message });
+                }
+                // A crossfade's incoming track mirrors the setting, or it
+                // would be adopted at the old tempo.
+                if let Some(transition) = self.transition.as_mut() {
+                    if let Err(message) = transition.chain.set_time_stretch(enabled, ratio) {
+                        self.emit(EngineEvent::Error { message });
+                    }
+                }
+                let (enabled, ratio) = self.chain.time_stretch();
+                self.emit(EngineEvent::TimeStretch { enabled, ratio });
+            }
             EngineCommand::SetDevice(id) => {
                 self.device_id = id;
                 // Rebuilding the stream is the only way to change device, and
@@ -457,6 +493,13 @@ impl Engine {
                         // the channel count changed.
                         if let Some(rate) = self.decoder.as_ref().map(|d| d.format().sample_rate) {
                             self.rebuild_resampler(rate);
+                        }
+                        // The chain's effects are (device rate, channels)-
+                        // shaped too.
+                        let (device_rate, device_channels) =
+                            (self.device_rate(), self.device_channels() as usize);
+                        if let Err(message) = self.chain.reconfigure(device_rate, device_channels) {
+                            self.emit(EngineEvent::Error { message });
                         }
                         // Anything already resampled is shaped for the old
                         // device.
@@ -646,6 +689,11 @@ impl Engine {
                 codec: format.codec,
             });
         }
+        #[cfg(feature = "stretch")]
+        {
+            let (enabled, ratio) = self.chain.time_stretch();
+            self.emit(EngineEvent::TimeStretch { enabled, ratio });
+        }
         // Before `State`, whose index refers into this queue. The `State`
         // event alone cannot rebuild a reloaded webview's track list.
         if !self.queue.is_empty() {
@@ -701,6 +749,7 @@ impl Engine {
         self.decoder = None;
         self.preloaded = None;
         self.pending_out.clear();
+        self.chain.reset();
         self.boundaries.clear();
         self.fade_then_pause();
         self.emit_state();
@@ -748,6 +797,7 @@ impl Engine {
                 // counting up from where it was.
                 self.params.request_flush();
                 self.pending_out.clear();
+                self.chain.reset();
                 self.boundaries.clear();
                 let rate = self.device_rate().max(1) as f64;
                 self.frames_written = (landed * rate) as u64;
@@ -850,6 +900,12 @@ impl Engine {
         self.start_measuring(&format);
         self.apply_gain(gain_db);
         self.rebuild_resampler(format.sample_rate);
+        // The chain learns the device shape here (its effects are shaped by
+        // it, not by the source) and starts the new track with fresh state.
+        let (device_rate, device_channels) = (self.device_rate(), self.device_channels() as usize);
+        if let Err(message) = self.chain.reconfigure(device_rate, device_channels) {
+            self.emit(EngineEvent::Error { message });
+        }
         self.decoder = Some(decoder);
         self.preloaded = None;
 
@@ -897,7 +953,10 @@ impl Engine {
             self.preloaded = None;
             return;
         };
-        let remaining = self.current_duration - self.position_secs();
+        // Source time left, over the chain's time ratio: what matters here is
+        // wall-clock time until the decoder is needed.
+        let remaining =
+            (self.current_duration - self.position_secs()) / self.chain.time_ratio().max(0.01);
         if self.preloaded.is_none() && remaining <= PRELOAD_SECS {
             match Decoder::open_file(&next.path) {
                 Ok(decoder) => self.preloaded = Some(decoder),
@@ -938,13 +997,23 @@ impl Engine {
             .unwrap_or(channels)
             .max(1);
 
+        // An effect can produce more frames than it was fed (time-stretch
+        // slowing down), so ring room alone no longer bounds `pending_out`.
+        // Hold the decoder until the backlog clears rather than piling up
+        // latency; without effects the backlog never reaches this.
+        let backlog = self.pending_out.len() >= PUMP_FRAMES * channels * 2;
+
         self.decode_buf.resize(PUMP_FRAMES * source_channels, 0.0);
-        let read = match self.decoder.as_mut().unwrap().read(&mut self.decode_buf) {
-            Ok(read) => read,
-            Err(message) => {
-                self.emit(EngineEvent::Error { message });
-                self.advance_or_stop();
-                return true;
+        let read = if backlog {
+            0
+        } else {
+            match self.decoder.as_mut().unwrap().read(&mut self.decode_buf) {
+                Ok(read) => read,
+                Err(message) => {
+                    self.emit(EngineEvent::Error { message });
+                    self.advance_or_stop();
+                    return true;
+                }
             }
         };
 
@@ -968,18 +1037,35 @@ impl Engine {
             // produces more frames than were read, so the ring may not have
             // room for all of them this turn. The remainder waits rather than
             // being dropped, which would be an audible gap.
-            let mapped = std::mem::take(&mut self.mapped_buf);
-            if let Some(resampler) = self.resampler.as_mut() {
-                if let Err(message) = resampler.process(&mapped, &mut self.pending_out) {
-                    self.emit(EngineEvent::Error { message });
-                }
-            } else {
-                self.pending_out.extend_from_slice(&mapped);
+            let result = self.chain.process(
+                self.resampler.as_mut(),
+                &self.mapped_buf,
+                &mut self.pending_out,
+                self.frames_written,
+            );
+            if let Err(message) = result {
+                self.emit(EngineEvent::Error { message });
             }
-            self.mapped_buf = mapped;
         }
 
         let pushed = self.push_pending(channels);
+
+        // An exhausted decoder can leave a tail inside the chain's effects,
+        // invisible to the emptiness check below. Flush it — except into a
+        // gapless join, where the chain survives the handover and its tail
+        // flows seamlessly into the next track instead (mirroring the kept
+        // resampler in `retune_resampler_for_join`).
+        if self.decoder.as_ref().is_some_and(|d| d.is_exhausted()) {
+            let gapless_join = self.gapless
+                && self.mode == Mode::Local
+                && self.transition.is_none()
+                && self.queue.peek_next().is_some();
+            if !gapless_join {
+                if let Err(message) = self.chain.drain(&mut self.pending_out) {
+                    self.emit(EngineEvent::Error { message });
+                }
+            }
+        }
 
         // Only move on once the tail of this track has actually been handed
         // over — otherwise the last fraction of a second is lost, which is
@@ -1071,17 +1157,14 @@ impl Engine {
                             channels,
                             &mut transition.mapped_buf,
                         );
-                        let mapped = std::mem::take(&mut transition.mapped_buf);
-                        let result = match transition.resampler.as_mut() {
-                            Some(resampler) => {
-                                resampler.process(&mapped, &mut transition.pending_in)
-                            }
-                            None => {
-                                transition.pending_in.extend_from_slice(&mapped);
-                                Ok(())
-                            }
-                        };
-                        transition.mapped_buf = mapped;
+                        // Ring position 0 is a placeholder: a mirror chain
+                        // records no timeline markers until it is adopted.
+                        let result = transition.chain.process(
+                            transition.resampler.as_mut(),
+                            &transition.mapped_buf,
+                            &mut transition.pending_in,
+                            0,
+                        );
                         if let Err(message) = result {
                             error = Some(message);
                         }
@@ -1106,7 +1189,10 @@ impl Engine {
         let Some(next) = self.queue.peek_next().cloned() else {
             return false;
         };
-        let remaining = self.current_duration - self.position_secs();
+        // `remaining` is source time; the fade spans wall-clock time, and a
+        // time-changing effect makes them differ by its ratio.
+        let remaining =
+            (self.current_duration - self.position_secs()) / self.chain.time_ratio().max(0.01);
         if remaining > CROSSFADE_SECS {
             return false;
         }
@@ -1148,6 +1234,7 @@ impl Engine {
             duration_secs: format.duration_secs.unwrap_or(next.duration_secs),
             decoder,
             resampler,
+            chain: self.chain.spawn_mirror(),
             entry: next,
             outgoing_index,
             total_frames: total_frames.max(1),
@@ -1173,6 +1260,10 @@ impl Engine {
 
         self.decoder = Some(transition.decoder);
         self.resampler = transition.resampler;
+        self.chain = transition.chain;
+        // The adopted mirror starts its timeline fresh from the ring
+        // position — the same origin approximation the boundary below makes.
+        self.chain.adopt_timeline();
         self.pending_out = transition.pending_in;
         self.current_duration = transition.duration_secs;
 
@@ -1286,8 +1377,9 @@ impl Engine {
             // the new track actually starts coming out of the speakers.
             // Anything the retune drained into `pending_out` is still the
             // outgoing track, so the boundary sits past it.
-            let pending_frames =
-                self.pending_out.len() as u64 / self.device_channels().max(1) as u64;
+            let pending_frames = self.pending_out.len() as u64
+                / self.device_channels().max(1) as u64
+                + self.chain.pending_output_frames();
             self.boundaries.push_back(Boundary {
                 frame: self.frames_written + pending_frames,
                 index: self.queue.index(),
@@ -1387,6 +1479,12 @@ impl Engine {
 
     /// Seconds into the current track, derived from what the callback has
     /// actually played rather than from what the decoder has run ahead to.
+    ///
+    /// At 1× this is a plain division: one device frame played is one source
+    /// frame of musical time. A time-changing effect breaks that, so when the
+    /// chain has recorded timeline markers the position is the difference in
+    /// mapped source seconds instead; frames no marker covers were 1:1 by
+    /// construction and keep the division.
     fn position_secs(&self) -> f64 {
         let rate = self.device_rate();
         if rate == 0 {
@@ -1400,7 +1498,14 @@ impl Engine {
             .find(|b| b.frame <= played)
             .map(|b| b.frame)
             .unwrap_or(0);
-        (played.saturating_sub(base)) as f64 / rate as f64
+        match (self.chain.stream_secs(played), self.chain.stream_secs(base)) {
+            (None, None) => (played.saturating_sub(base)) as f64 / rate as f64,
+            (played_secs, base_secs) => {
+                let played_secs = played_secs.unwrap_or(played as f64 / rate as f64);
+                let base_secs = base_secs.unwrap_or(base as f64 / rate as f64);
+                (played_secs - base_secs).max(0.0)
+            }
+        }
     }
 
     fn emit_progress(&mut self) {
@@ -1421,6 +1526,14 @@ impl Engine {
         while self.boundaries.len() > 1 && self.boundaries[1].frame <= played {
             self.boundaries.pop_front();
         }
+        // The timeline only ever gets looked up at `played` and at the
+        // current boundary origin; markers behind both are done with.
+        let keep_from = self
+            .boundaries
+            .front()
+            .map(|b| b.frame.min(played))
+            .unwrap_or(played);
+        self.chain.prune_timeline(keep_from);
 
         if let Some(boundary) = self.boundaries.front().filter(|b| b.frame <= played) {
             let (index, duration, gain_db) =
@@ -1592,6 +1705,92 @@ mod tests {
             test_runtime(),
             None,
         )
+    }
+
+    /// Collects emitted events, for the tests that assert on the echo.
+    #[cfg(feature = "stretch")]
+    struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
+
+    #[cfg(feature = "stretch")]
+    impl crate::EventSink for CaptureSink {
+        fn send_event(&self, event: EngineEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+        fn send_frame(&self, _frame: &[u8]) {}
+    }
+
+    #[cfg(feature = "stretch")]
+    fn captured_engine() -> (Engine, Arc<CaptureSink>) {
+        let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let engine = Engine::new(
+            no_store(),
+            rx,
+            tx,
+            Arc::new(Params::default()),
+            sink.clone(),
+            Arc::new(AtomicU64::new(0)),
+            test_runtime(),
+            None,
+        );
+        (engine, sink)
+    }
+
+    #[cfg(feature = "stretch")]
+    #[test]
+    fn set_time_stretch_clamps_the_ratio_and_echoes_the_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetTimeStretch {
+            enabled: true,
+            ratio: 9.0,
+        });
+
+        let events = sink.0.lock().unwrap();
+        let echoed = events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::TimeStretch { enabled, ratio } => Some((*enabled, *ratio)),
+                _ => None,
+            })
+            .expect("the setting must be echoed");
+        assert_eq!(echoed, (true, 2.0), "9.0 clamps to the supported maximum");
+        assert_eq!(engine.chain.time_stretch(), (true, 2.0));
+    }
+
+    #[cfg(feature = "stretch")]
+    #[test]
+    fn a_non_finite_ratio_is_dropped_not_applied() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetTimeStretch {
+            enabled: true,
+            ratio: f32::NAN,
+        });
+        assert!(sink.0.lock().unwrap().is_empty(), "no echo, no effect");
+        assert_eq!(engine.chain.time_stretch(), (false, 1.0));
+    }
+
+    #[cfg(feature = "stretch")]
+    #[test]
+    fn describe_recovers_the_time_stretch_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetTimeStretch {
+            enabled: true,
+            ratio: 1.25,
+        });
+        sink.0.lock().unwrap().clear();
+
+        engine.describe();
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EngineEvent::TimeStretch {
+                    enabled: true,
+                    ratio,
+                } if (*ratio - 1.25).abs() < 1e-6
+            )),
+            "a reloaded UI must recover the setting from describe()"
+        );
     }
 
     /// A store that wants everything measured — what arms the measuring path
@@ -2275,6 +2474,67 @@ mod tests {
             played > 4_000,
             "only {played} frames played, expected the stream to be running"
         );
+    }
+
+    /// End-to-end with time-stretch on the path: at half tempo the playhead
+    /// must advance at roughly half wall-clock speed — the timeline markers,
+    /// not the device frame counter, are what report position.
+    ///
+    /// `cargo test --features stretch -- --ignored half_tempo --nocapture`.
+    #[cfg(feature = "stretch")]
+    #[test]
+    #[ignore = "requires a real audio output device"]
+    fn half_tempo_halves_the_reported_position_rate() {
+        let dir = std::env::temp_dir().join("janis-engine-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("stretch-tone.wav");
+        let wav = fixtures::wav_bytes(44_100, 2, &fixtures::tone(44_100, 2, 4 * 44_100, 440.0));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(&wav))
+            .expect("write test tone");
+
+        let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
+        let engine = crate::init(no_store(), sink.clone(), None);
+        engine.set_volume(0.0);
+        engine.set_time_stretch(true, 0.5);
+        engine.load_queue(
+            vec![QueueEntry {
+                track_id: 1,
+                path: path.clone(),
+                duration_secs: 4.0,
+                gain_db: 0.0,
+            }],
+            0,
+        );
+
+        let wall = Duration::from_millis(1_500);
+        std::thread::sleep(wall);
+        let played = engine.frames_played();
+        engine.shutdown();
+        let _ = std::fs::remove_file(&path);
+
+        let position = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                EngineEvent::Position { position_secs, .. } => Some(*position_secs),
+                _ => None,
+            })
+            .expect("position events were emitted");
+
+        assert!(played > 4_000, "only {played} frames played");
+        // At tempo 0.5 the playhead covers ~half the wall time. The device
+        // open eats an unknown slice of the sleep, so only bound it above:
+        // an unstretched playhead would read close to the full wall time.
+        assert!(
+            position < wall.as_secs_f64() * 0.75,
+            "position {position:.2}s advanced too fast for half tempo over {:.2}s",
+            wall.as_secs_f64()
+        );
+        assert!(position > 0.2, "position {position:.2}s never advanced");
     }
 
     /// Serves a short stream that ends, and checks the engine goes back for

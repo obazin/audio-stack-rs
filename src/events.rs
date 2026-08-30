@@ -82,6 +82,12 @@ pub enum EngineEvent {
         sample_rate: u32,
         channels: u16,
     },
+    /// The time-stretch setting, echoed on every change and on subscribe so
+    /// a reloaded UI recovers it. `ratio` 1.0 is normal speed; pitch is
+    /// never affected.
+    #[cfg(feature = "stretch")]
+    #[serde(rename_all = "camelCase")]
+    TimeStretch { enabled: bool, ratio: f32 },
     /// Playback failed. Non-fatal: the engine stays alive and idle.
     #[serde(rename_all = "camelCase")]
     Error { message: String },
@@ -123,6 +129,18 @@ mod tests {
         assert!(encoded.contains(r#""queueLen":10"#), "{encoded}");
         assert!(encoded.contains(r#""stationId":null"#), "{encoded}");
         assert!(encoded.contains(r#""mode":"local""#), "{encoded}");
+    }
+
+    #[cfg(feature = "stretch")]
+    #[test]
+    fn time_stretch_event_is_tagged_and_camel_cased() {
+        let encoded = json(&EngineEvent::TimeStretch {
+            enabled: true,
+            ratio: 1.5,
+        });
+        assert!(encoded.contains(r#""event":"timeStretch""#), "{encoded}");
+        assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
+        assert!(encoded.contains(r#""ratio":1.5"#), "{encoded}");
     }
 
     #[test]
