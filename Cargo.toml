@@ -1,0 +1,86 @@
+[package]
+name = "audio-stack-rs"
+version = "0.1.0"
+description = "A self-contained Rust audio stack: a gapless/crossfading playback engine (cpal + symphonia), web-radio streaming with now-playing metadata, EBU R128 loudness normalization, a live analyser, and audio-file tag/cover metadata parsing — behind one host-agnostic facade."
+authors = ["Olivier Bazin"]
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/obazin/audio-stack-rs"
+readme = "README.md"
+keywords = ["audio", "playback", "cpal", "symphonia", "radio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# ── Output + decode + DSP ────────────────────────────────────────────────────
+# Cross-platform device I/O: CoreAudio, WASAPI, ALSA. Owns the realtime
+# callback — the only thread allowed to touch the output buffer.
+cpal = "0.18"
+# Decoding + demuxing. Non-default features are opt-in, so every container and
+# codec the metadata scanner accepts is enabled explicitly here; `opt-simd`
+# turns on the SSE/AVX/NEON kernels.
+symphonia = { version = "0.6", features = [
+    "aac",
+    "adpcm",
+    "aiff",
+    "alac",
+    "all-meta",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "opt-simd",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+# Sample-rate conversion, bypassed entirely when the file already matches the
+# device rate (the common case, and the only way to stay bit-transparent).
+rubato = "5"
+# The ten peaking filters of the EQ, one bank per channel.
+biquad = "0.6"
+# Real-input FFT for the spectrum bands — half the work of a complex FFT.
+realfft = "3.5"
+# Lock-free SPSC ring: decoder thread produces, realtime callback consumes.
+rtrb = "0.4"
+# Control-plane channel: facade commands -> engine thread.
+crossbeam-channel = "0.5"
+# EBU R128 loudness, for files whose tags carry no ReplayGain. Pure Rust.
+ebur128 = "0.1"
+# Opus. Symphonia 0.6 has no Opus decoder, so `opus.rs` wraps libopus as one.
+# `opusic-sys` builds libopus from bundled source with cmake. `symphonia-common`
+# is not re-exported by the `symphonia` facade but carries the OpusHead parser,
+# pinned to the same version so the two cannot drift apart.
+opus = "0.4"
+symphonia-common = "0.6.1"
+
+# ── Web radio ────────────────────────────────────────────────────────────────
+# Buffers an HTTP stream into something `Read + Seek`, which is what Symphonia
+# needs — so a station goes through exactly the same decode/EQ/analyser path as
+# a local file. `default-features = false` keeps reqwest off native-tls (and so
+# off OpenSSL on Linux).
+stream-download = { version = "0.24", default-features = false, features = [
+    "reqwest",
+    "reqwest-rustls",
+    "temp-storage",
+] }
+# Icecast/Shoutcast in-band track titles, stripped out of the audio stream.
+icy-metadata = { version = "0.6", features = ["reqwest"] }
+
+# ── Metadata ─────────────────────────────────────────────────────────────────
+# Tag + audio-properties reading for every format the engine plays (MP3, FLAC,
+# WAV, AAC/ALAC in MP4, OGG/Opus, AIFF — the `AUDIO_EXTENSIONS` list in
+# `metadata.rs` is authoritative). Also serves embedded cover art.
+lofty = "0.22"
+# Embedded/remote cover art is handed to the host as a base64 `data:` URL.
+base64 = "0.22"
+
+# ── Cross-cutting ────────────────────────────────────────────────────────────
+# Wire types (events, devices, cover art, queue/station inputs) derive serde so
+# the host can forward them to its UI verbatim; provider JSON is parsed here too.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+# `log` facade only — the host installs whatever logger it likes.
+log = "0.4.29"
+# Owns a small runtime for the detached network tasks (reconnect, now-playing
+# pollers); the one async entry point (`play_stream`) is driven by the caller.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
