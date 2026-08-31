@@ -40,7 +40,12 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 /// `drain` flushes the staged remainder and the `kernel_len − 1` tail, so a
 /// stream's total output is `input_len + kernel_len − 1` frames — the length of
 /// the full linear convolution.
-pub struct Convolver {
+/// The immutable, transformed side of a convolution: the partitioned kernel
+/// spectra and the FFT plans, all shareable. Building it FFTs the kernel once;
+/// wrapping it in an `Arc` lets many [`Convolver`]s — one per channel, plus a
+/// crossfade's mirror — share that work instead of each re-transforming a large
+/// impulse response.
+pub struct Kernel {
     /// Partition size; the FFT is twice this.
     block: usize,
     fft_size: usize,
@@ -48,31 +53,15 @@ pub struct Convolver {
     /// round trip scales by `fft_size` and the output is divided back down.
     inv_n: f32,
     kernel_len: usize,
+    bins: usize,
     r2c: Arc<dyn RealToComplex<f32>>,
     c2r: Arc<dyn ComplexToReal<f32>>,
     /// One spectrum per kernel partition, transformed once at construction.
-    kernel: Vec<Vec<Complex<f32>>>,
-    /// Frequency-domain delay line: the last `kernel.len()` input-block
-    /// spectra, newest at `write`.
-    fdl: Vec<Vec<Complex<f32>>>,
-    write: usize,
-    /// The previous input block, the left half of the overlap-save window.
-    history: Vec<f32>,
-    /// Preallocated scratch, reused every block.
-    block_scratch: Vec<f32>,
-    fft_in: Vec<f32>,
-    fft_out: Vec<f32>,
-    spectrum: Vec<Complex<f32>>,
-    accum: Vec<Complex<f32>>,
-    fft_scratch: Vec<Complex<f32>>,
-    /// Input held until a whole block is available.
-    staged: Vec<f32>,
-    frames_in: usize,
-    frames_out: usize,
+    partitions: Vec<Vec<Complex<f32>>>,
 }
 
-impl Convolver {
-    /// Builds a convolver for `kernel`, partitioned into `block`-sample blocks.
+impl Kernel {
+    /// Transforms `kernel` into `block`-sample partition spectra.
     ///
     /// Panics if `block` is zero or `kernel` is empty — both are programmer
     /// errors, not runtime conditions, on this decode-thread-only path.
@@ -92,10 +81,10 @@ impl Convolver {
         // Transform each kernel partition once: partition `p` is
         // `kernel[p·block .. p·block+block]`, zero-padded into the FFT's left
         // half (the right half stays zero, the overlap-save convention).
-        let partitions = kernel.len().div_ceil(block);
-        let mut kernel_spectra = Vec::with_capacity(partitions);
+        let count = kernel.len().div_ceil(block);
+        let mut partitions = Vec::with_capacity(count);
         let mut pad = r2c.make_input_vec();
-        for p in 0..partitions {
+        for p in 0..count {
             let start = p * block;
             let end = (start + block).min(kernel.len());
             pad.iter_mut().for_each(|s| *s = 0.0);
@@ -103,7 +92,7 @@ impl Convolver {
             let mut spectrum = r2c.make_output_vec();
             r2c.process_with_scratch(&mut pad, &mut spectrum, &mut fft_scratch)
                 .expect("kernel partition fft");
-            kernel_spectra.push(spectrum);
+            partitions.push(spectrum);
         }
 
         Self {
@@ -111,24 +100,82 @@ impl Convolver {
             fft_size,
             inv_n: 1.0 / fft_size as f32,
             kernel_len: kernel.len(),
-            fdl: (0..partitions)
+            bins,
+            r2c,
+            c2r,
+            partitions,
+        }
+    }
+
+    /// Frames of impulse response, i.e. the linear-convolution tail length + 1.
+    pub fn len(&self) -> usize {
+        self.kernel_len
+    }
+}
+
+/// Streaming uniformly-partitioned convolution against a shared [`Kernel`].
+///
+/// Holds only the per-stream mutable state (the FDL, staging, scratch); the
+/// transformed kernel lives behind an `Arc`, so [`spawn`](Self::spawn) makes a
+/// fresh, independent convolver over the same impulse response for free.
+pub struct Convolver {
+    kernel: Arc<Kernel>,
+    /// Frequency-domain delay line: the last `partitions` input-block spectra,
+    /// newest at `write`.
+    fdl: Vec<Vec<Complex<f32>>>,
+    write: usize,
+    /// The previous input block, the left half of the overlap-save window.
+    history: Vec<f32>,
+    /// Preallocated scratch, reused every block.
+    block_scratch: Vec<f32>,
+    fft_in: Vec<f32>,
+    fft_out: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    accum: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
+    /// Input held until a whole block is available.
+    staged: Vec<f32>,
+    frames_in: usize,
+    frames_out: usize,
+}
+
+impl Convolver {
+    /// Builds a convolver for `kernel`, partitioned into `block`-sample blocks.
+    pub fn new(kernel: &[f32], block: usize) -> Self {
+        Self::from_kernel(Arc::new(Kernel::new(kernel, block)))
+    }
+
+    /// Builds a fresh convolver over an already-transformed shared kernel — the
+    /// per-channel and crossfade-mirror path that pays no FFT cost.
+    pub fn from_kernel(kernel: Arc<Kernel>) -> Self {
+        let block = kernel.block;
+        let bins = kernel.bins;
+        let scratch_len = kernel
+            .r2c
+            .get_scratch_len()
+            .max(kernel.c2r.get_scratch_len());
+        Self {
+            fdl: (0..kernel.partitions.len())
                 .map(|_| vec![Complex::default(); bins])
                 .collect(),
             write: 0,
             history: vec![0.0; block],
             block_scratch: vec![0.0; block],
-            fft_in: vec![0.0; fft_size],
-            fft_out: vec![0.0; fft_size],
+            fft_in: vec![0.0; kernel.fft_size],
+            fft_out: vec![0.0; kernel.fft_size],
             spectrum: vec![Complex::default(); bins],
             accum: vec![Complex::default(); bins],
-            fft_scratch,
-            kernel: kernel_spectra,
+            fft_scratch: vec![Complex::default(); scratch_len],
             staged: Vec::with_capacity(block),
             frames_in: 0,
             frames_out: 0,
-            r2c,
-            c2r,
+            kernel,
         }
+    }
+
+    /// A clone of the shared kernel, for building an aligned second convolver.
+    pub fn shared_kernel(&self) -> Arc<Kernel> {
+        Arc::clone(&self.kernel)
     }
 
     /// Latency the convolver itself adds: none. It is causal — output `i` is
@@ -141,13 +188,13 @@ impl Convolver {
     /// Convolves `input`, appending whole blocks of result to `output`. Input
     /// that does not complete a block is staged for the next call.
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        let block = self.kernel.block;
         self.frames_in += input.len();
         self.staged.extend_from_slice(input);
-        while self.staged.len() >= self.block {
-            self.block_scratch
-                .copy_from_slice(&self.staged[..self.block]);
+        while self.staged.len() >= block {
+            self.block_scratch.copy_from_slice(&self.staged[..block]);
             self.process_block(output);
-            self.staged.drain(..self.block);
+            self.staged.drain(..block);
         }
     }
 
@@ -158,18 +205,18 @@ impl Convolver {
         if self.frames_in == 0 {
             return;
         }
-        let target = self.frames_in + self.kernel_len - 1;
+        let block = self.kernel.block;
+        let target = self.frames_in + self.kernel.kernel_len - 1;
         let remaining = target - self.frames_out;
         let start = output.len();
         // Pad the staged partial and feed zero blocks until the whole tail has
         // been produced; the overshoot past `remaining` is exact silence.
-        let blocks = remaining.div_ceil(self.block);
-        self.staged.resize(blocks * self.block, 0.0);
+        let blocks = remaining.div_ceil(block);
+        self.staged.resize(blocks * block, 0.0);
         for _ in 0..blocks {
-            self.block_scratch
-                .copy_from_slice(&self.staged[..self.block]);
+            self.block_scratch.copy_from_slice(&self.staged[..block]);
             self.process_block(output);
-            self.staged.drain(..self.block);
+            self.staged.drain(..block);
         }
         output.truncate(start + remaining);
         self.reset();
@@ -190,10 +237,12 @@ impl Convolver {
     /// Transforms one block (in `block_scratch`), multiply-accumulates it
     /// against the partitioned kernel, and appends the alias-free result.
     fn process_block(&mut self, output: &mut Vec<f32>) {
+        let block = self.kernel.block;
         // Overlap-save window: [previous block | current block].
-        self.fft_in[..self.block].copy_from_slice(&self.history);
-        self.fft_in[self.block..].copy_from_slice(&self.block_scratch);
-        self.r2c
+        self.fft_in[..block].copy_from_slice(&self.history);
+        self.fft_in[block..].copy_from_slice(&self.block_scratch);
+        self.kernel
+            .r2c
             .process_with_scratch(&mut self.fft_in, &mut self.spectrum, &mut self.fft_scratch)
             .expect("forward fft");
 
@@ -201,11 +250,11 @@ impl Convolver {
         self.fdl[self.write].copy_from_slice(&self.spectrum);
 
         // Y = Σ_p kernel[p] · X[block p ago].
-        let partitions = self.kernel.len();
+        let partitions = self.kernel.partitions.len();
         self.accum.iter_mut().for_each(|c| *c = Complex::default());
         for p in 0..partitions {
             let past = (self.write + partitions - p) % partitions;
-            let kernel = &self.kernel[p];
+            let kernel = &self.kernel.partitions[p];
             let block = &self.fdl[past];
             for ((acc, k), x) in self.accum.iter_mut().zip(kernel).zip(block) {
                 *acc += k * x;
@@ -222,14 +271,16 @@ impl Convolver {
         if let Some(last) = self.accum.last_mut() {
             last.im = 0.0;
         }
-        self.c2r
+        self.kernel
+            .c2r
             .process_with_scratch(&mut self.accum, &mut self.fft_out, &mut self.fft_scratch)
             .expect("inverse fft");
 
         // Overlap-save keeps the second half — the first is circular-aliased.
-        output.extend(self.fft_out[self.block..].iter().map(|s| s * self.inv_n));
+        let inv_n = self.kernel.inv_n;
+        output.extend(self.fft_out[block..].iter().map(|s| s * inv_n));
         self.history.copy_from_slice(&self.block_scratch);
-        self.frames_out += self.block;
+        self.frames_out += block;
     }
 }
 
@@ -275,11 +326,13 @@ impl StereoConvolver {
     /// `kernel` and `block`.
     pub fn new(kernel: &[f32], block: usize, channels: usize) -> Self {
         assert!(channels > 0, "convolver needs at least one channel");
+        // One transformed kernel, shared across the channels' convolvers.
+        let shared = Arc::new(Kernel::new(kernel, block));
         Self {
             channels,
             block,
             active: (0..channels)
-                .map(|_| Convolver::new(kernel, block))
+                .map(|_| Convolver::from_kernel(Arc::clone(&shared)))
                 .collect(),
             next: None,
             fade_pos: 0,
@@ -300,8 +353,9 @@ impl StereoConvolver {
     /// active kernel to this newest one, discarding the previous incoming one.
     pub fn set_kernel(&mut self, kernel: &[f32]) {
         let channels = self.channels;
+        let shared = Arc::new(Kernel::new(kernel, self.block));
         let mut next: Vec<Convolver> = (0..channels)
-            .map(|_| Convolver::new(kernel, self.block))
+            .map(|_| Convolver::from_kernel(Arc::clone(&shared)))
             .collect();
         // Prime with the retained history so the new kernel is warm. The
         // history is whole blocks, so each primed convolver ends on a block
@@ -851,5 +905,41 @@ mod tests {
         let periodic = hann_periodic(8);
         assert!(periodic[0].abs() < 1e-6, "periodic Hann is zero at index 0");
         assert!(periodic[4] > 0.99, "and peaks at the centre");
+    }
+
+    #[test]
+    fn convolvers_over_a_shared_kernel_match_a_standalone_one() {
+        // A convolver built from a shared kernel must produce exactly the same
+        // output as one that transformed the kernel itself, and hold a
+        // reference to the shared kernel (the Arc-sharing spawn_mirror relies on).
+        let kernel_taps = noise(200, 11);
+        let input = noise(600, 12);
+
+        let shared = std::sync::Arc::new(Kernel::new(&kernel_taps, BLOCK));
+        let before = std::sync::Arc::strong_count(&shared);
+        let mut shared_conv = Convolver::from_kernel(std::sync::Arc::clone(&shared));
+        assert!(
+            std::sync::Arc::strong_count(&shared) > before,
+            "from_kernel must retain the shared kernel"
+        );
+        let mut owned_conv = Convolver::new(&kernel_taps, BLOCK);
+
+        let mut shared_out = Vec::new();
+        shared_conv.process(&input, &mut shared_out);
+        shared_conv.drain(&mut shared_out);
+        let mut owned_out = Vec::new();
+        owned_conv.process(&input, &mut owned_out);
+        owned_conv.drain(&mut owned_out);
+
+        assert_eq!(shared_out.len(), owned_out.len());
+        let max = shared_out
+            .iter()
+            .zip(&owned_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 1e-6,
+            "a shared kernel must convolve identically: {max}"
+        );
     }
 }
