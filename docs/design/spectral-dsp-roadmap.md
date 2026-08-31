@@ -35,6 +35,14 @@ Every effect phase plugs into the existing `Chain` (`src/chain.rs`) and therefor
 
 ## Phase 2 — True-peak loudness (BS.1770-4)
 
+> **Status update (2026-08-31, superseded): premise was false; landed as a regression test + docs, not a hand-rolled FIR.** Phase 2's goal below rests on "`Measured` currently records sample peak" and calls for hand-rolling a BS.1770-4 4× polyphase FIR true-peak estimator. That is false against the code: `src/loudness.rs` has, since the initial commit, built the meter with `Mode::I | Mode::TRUE_PEAK` and filled `Measured.peak` from `ebur128`'s `true_peak()` — which is itself a polyphase FIR oversampling 4× (2× above 96 kHz) per BS.1770-4. The measured path was already true peak, and the gain-clamp already uses it. Hand-rolling the FIR would duplicate a tested dependency on the one path where a wrong gain silently clips the DAC. So Phase 2 was implemented as "skip the FIR, add the gap":
+>
+> - The canonical inter-sample-peak regression test (`true_peak_catches_an_inter_sample_peak_the_samples_miss`): a full-scale Fs/4 sine phased so every sample sits at ±0.707 (−3 dBFS) while the reconstructed crest reaches full scale. The meter reads 1.012 (> 0 dBTP) — proving the inter-sample overshoot a bare sample read would miss is caught. This is exactly the task-5 fixture below, now green.
+> - Doc clarifications on `Measured::peak`, `finish`, and `parse_peak` — spelling out that measured peak is BS.1770-4 true peak while ReplayGain tag peaks are sample peak, so the two aren't directly comparable.
+> - A project memory recording that Phase 2's premise is superseded, so a future session doesn't try the FIR again.
+>
+> The remaining tasks below (own FIR, `Measured` field addition + semver decision) are therefore **not** to be implemented; they are kept for the record only.
+
 **Goal:** close the correctness gap in normalization: `Measured` currently records sample peak, which under-reads inter-sample peaks by up to ~3 dB on hot masters, so a "safe" normalization gain can still clip the DAC.
 
 **Files:** `src/loudness.rs`, `src/spectral.rs` (or a small FIR inline in loudness.rs), README.
