@@ -110,6 +110,13 @@ pub enum EngineCommand {
         ir_path: Option<std::path::PathBuf>,
         mix: f32,
     },
+    /// Enables/disables pitch-shift and sets its cents (±1200 = ±one octave).
+    /// Duration-preserving; disabling ramps to normal pitch.
+    #[cfg(feature = "pitch")]
+    SetPitchShift {
+        enabled: bool,
+        cents: f32,
+    },
     /// A now-playing poller reporting what a station is playing. Carries the
     /// epoch it started under so a late answer about a station the listener
     /// has already left is discarded.
@@ -541,6 +548,22 @@ impl Engine {
                 let (enabled, mix) = self.chain.convolution();
                 self.emit(EngineEvent::Convolution { enabled, mix });
             }
+            #[cfg(feature = "pitch")]
+            EngineCommand::SetPitchShift { enabled, cents } => {
+                if !cents.is_finite() {
+                    return;
+                }
+                if let Err(message) = self.chain.set_pitch_shift(enabled, cents) {
+                    self.emit(EngineEvent::Error { message });
+                }
+                if let Some(transition) = self.transition.as_mut() {
+                    if let Err(message) = transition.chain.set_pitch_shift(enabled, cents) {
+                        self.emit(EngineEvent::Error { message });
+                    }
+                }
+                let (enabled, cents) = self.chain.pitch_shift();
+                self.emit(EngineEvent::PitchShift { enabled, cents });
+            }
             EngineCommand::SetDevice(id) => {
                 self.device_id = id;
                 // Rebuilding the stream is the only way to change device, and
@@ -799,6 +822,11 @@ impl Engine {
         {
             let (enabled, mix) = self.chain.convolution();
             self.emit(EngineEvent::Convolution { enabled, mix });
+        }
+        #[cfg(feature = "pitch")]
+        {
+            let (enabled, cents) = self.chain.pitch_shift();
+            self.emit(EngineEvent::PitchShift { enabled, cents });
         }
         // Before `State`, whose index refers into this queue. The `State`
         // event alone cannot rebuild a reloaded webview's track list.
@@ -1826,7 +1854,8 @@ mod tests {
         feature = "stretch",
         feature = "fir-eq",
         feature = "convolution",
-        feature = "analysis"
+        feature = "analysis",
+        feature = "pitch"
     ))]
     struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
 
@@ -1834,7 +1863,8 @@ mod tests {
         feature = "stretch",
         feature = "fir-eq",
         feature = "convolution",
-        feature = "analysis"
+        feature = "analysis",
+        feature = "pitch"
     ))]
     impl crate::EventSink for CaptureSink {
         fn send_event(&self, event: EngineEvent) {
@@ -1847,7 +1877,8 @@ mod tests {
         feature = "stretch",
         feature = "fir-eq",
         feature = "convolution",
-        feature = "analysis"
+        feature = "analysis",
+        feature = "pitch"
     ))]
     fn captured_engine() -> (Engine, Arc<CaptureSink>) {
         let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
@@ -2099,6 +2130,61 @@ mod tests {
             "a partial listen must not report analysis"
         );
         assert!(engine.analysing.is_none(), "but the state is still dropped");
+    }
+
+    #[cfg(feature = "pitch")]
+    #[test]
+    fn set_pitch_shift_clamps_the_cents_and_echoes_the_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetPitchShift {
+            enabled: true,
+            cents: 5_000.0,
+        });
+
+        let echoed = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::PitchShift { enabled, cents } => Some((*enabled, *cents)),
+                _ => None,
+            })
+            .expect("the setting must be echoed");
+        assert_eq!(echoed, (true, 1_200.0), "5000 cents clamps to one octave");
+        assert_eq!(engine.chain.pitch_shift(), (true, 1_200.0));
+    }
+
+    #[cfg(feature = "pitch")]
+    #[test]
+    fn a_non_finite_cents_is_dropped() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetPitchShift {
+            enabled: true,
+            cents: f32::NAN,
+        });
+        assert!(sink.0.lock().unwrap().is_empty(), "no echo, no effect");
+        assert_eq!(engine.chain.pitch_shift(), (false, 0.0));
+    }
+
+    #[cfg(feature = "pitch")]
+    #[test]
+    fn describe_recovers_the_pitch_shift_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetPitchShift {
+            enabled: true,
+            cents: 300.0,
+        });
+        sink.0.lock().unwrap().clear();
+
+        engine.describe();
+        assert!(
+            sink.0.lock().unwrap().iter().any(|e| matches!(
+                e,
+                EngineEvent::PitchShift { enabled: true, cents } if (*cents - 300.0).abs() < 1e-3
+            )),
+            "a reloaded UI must recover the setting from describe()"
+        );
     }
 
     /// A store that wants everything measured — what arms the measuring path

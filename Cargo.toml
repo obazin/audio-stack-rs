@@ -43,6 +43,12 @@ convolution = []
 # dependency (it reuses the `realfft` the analyser already links), so
 # feature-off builds are byte-identical.
 analysis = []
+# Pitch-shift: an owned phase-vocoder pitch shifter parameterized in cents,
+# duration-preserving, in the decode-thread effect chain via
+# `AudioEngine::set_pitch_shift`. Pure code, no new dependency (it reuses the
+# `realfft` the analyser already links), so feature-off builds are
+# byte-identical.
+pitch = []
 
 # Audible time-stretch walkthrough: synthesizes a copyright-free clip and
 # steps the tempo live. `cargo run --example time_stretch --features stretch`.
@@ -56,6 +62,12 @@ required-features = ["stretch"]
 [[example]]
 name = "convolution"
 required-features = ["convolution"]
+
+# Audible pitch-shift walkthrough: synthesizes a clip and steps the pitch in
+# cents, duration unchanged. `cargo run --example pitch_shift --features pitch`.
+[[example]]
+name = "pitch_shift"
+required-features = ["pitch"]
 
 [dependencies]
 # ── Output + decode + DSP ────────────────────────────────────────────────────

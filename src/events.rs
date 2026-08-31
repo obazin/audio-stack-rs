@@ -111,6 +111,11 @@ pub enum EngineEvent {
         key: Option<String>,
         key_confidence: f32,
     },
+    /// The pitch-shift setting, echoed on every change and on subscribe so a
+    /// reloaded UI recovers it. `cents` 0 is normal pitch; ±1200 is an octave.
+    #[cfg(feature = "pitch")]
+    #[serde(rename_all = "camelCase")]
+    PitchShift { enabled: bool, cents: f32 },
     /// Playback failed. Non-fatal: the engine stays alive and idle.
     #[serde(rename_all = "camelCase")]
     Error { message: String },
@@ -205,6 +210,18 @@ mod tests {
         assert!(encoded.contains(r#""bpm":120.0"#), "{encoded}");
         assert!(encoded.contains(r#""bpmConfidence":0.8"#), "{encoded}");
         assert!(encoded.contains(r#""key":"C major""#), "{encoded}");
+    }
+
+    #[cfg(feature = "pitch")]
+    #[test]
+    fn pitch_shift_event_is_tagged_and_camel_cased() {
+        let encoded = json(&EngineEvent::PitchShift {
+            enabled: true,
+            cents: -700.0,
+        });
+        assert!(encoded.contains(r#""event":"pitchShift""#), "{encoded}");
+        assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
+        assert!(encoded.contains(r#""cents":-700.0"#), "{encoded}");
     }
 
     #[test]

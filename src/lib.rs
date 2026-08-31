@@ -38,6 +38,8 @@ mod nowplaying;
 mod opus;
 mod output;
 mod params;
+#[cfg(feature = "pitch")]
+mod pitch;
 mod queue;
 mod resample;
 mod spectral;
@@ -228,6 +230,17 @@ impl AudioEngine {
             ir_path,
             mix,
         });
+    }
+
+    /// Enables/disables pitch-shift and sets the shift in **cents** (100 cents
+    /// = one semitone, clamped to ±1200 = ±one octave). Duration is preserved,
+    /// so the playhead is unaffected; disabling ramps back to normal pitch
+    /// click-free and the effect leaves the signal path at the next track
+    /// change or seek. A change is heard once the buffered audio ahead has
+    /// played — up to about half a second. Echoed as [`EngineEvent::PitchShift`].
+    #[cfg(feature = "pitch")]
+    pub fn set_pitch_shift(&self, enabled: bool, cents: f32) {
+        let _ = self.send(EngineCommand::SetPitchShift { enabled, cents });
     }
 
     /// Re-emit everything the host needs to render current state. Call after a

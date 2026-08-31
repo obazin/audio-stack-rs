@@ -13,6 +13,7 @@ It was extracted from the [Janis](https://github.com/obazin/janis) desktop playe
 - **Time-stretch** *(opt-in `stretch` feature)* — live tempo control (0.25×–2×) with pitch preserved, toggled and adjusted during playback without a click via an effect chain in the decode path. The playhead stays correct while stretched.
 - **Linear-phase EQ** *(opt-in `fir-eq` feature)* — a mastering-style FIR EQ (the same ten bands as the realtime biquad EQ) with no inter-band phase distortion, run in the decode-path effect chain and toggled live without a click. Trades ~43 ms of latency for constant group delay; while on it takes over from the realtime EQ so the two never stack.
 - **Convolution reverb** *(opt-in `convolution` feature)* — a generic impulse-response effect (reverb, room/headphone correction, per-channel filtering): the host supplies an IR file, decoded and resampled to the device rate, applied in the decode-path effect chain with an equal-power wet/dry mix. Uniformly-partitioned frequency-domain convolution, causal (no added latency), IRs capped at ten seconds.
+- **Pitch-shift** *(opt-in `pitch` feature)* — an owned phase-vocoder pitch shifter parameterized in cents (±1200 = ±one octave), duration-preserving so the playhead is untouched, toggled and swept live without a click. Composes with time-stretch (each does its own job). Built on `realfft`, not the time-stretch crate.
 - **Music analysis** *(opt-in `analysis` feature)* — estimates tempo (BPM) and musical key of each local track heard end to end, from the samples the decode thread already sees (spectral-flux onset autocorrelation for tempo, Krumhansl–Schmuckler chroma matching for key), and reports them to the host as a `TrackAnalysis` event. Nothing to call: it runs automatically for whole listens.
 - **Live analyser** — a compact 170-byte visual frame (160 waveform points + 10 spectrum bands) pushed at ~60 Hz.
 - **Metadata parsing** — tag, audio-property, and embedded-cover reading via [lofty](https://crates.io/crates/lofty), plus filename-based track-number recovery. Pure functions returning plain data; you own the database.
@@ -69,6 +70,14 @@ audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1
   audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", features = ["analysis"] }
   ```
 
+- **`pitch`** *(opt-in)* — a duration-preserving pitch-shift via `AudioEngine::set_pitch_shift`, in cents (100 = one semitone, clamped to ±1200 = ±one octave). An owned phase vocoder over `realfft` (not the time-stretch crate), run in the decode-path effect chain and swept live without a click; latency ~43 ms while enabled. Pure Rust, no new dependency:
+
+  ```toml
+  audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", features = ["pitch"] }
+  ```
+
+  Hear it without writing a host: `cargo run --example pitch_shift --features pitch` synthesizes a clip and steps the pitch in cents while the tempo stays put.
+
 ## Usage
 
 Two traits keep the library agnostic, and one handle drives it:
@@ -121,7 +130,7 @@ let meta  = audio_stack_rs::read_metadata(std::path::Path::new("/music/track.fla
 let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>, base64 data URL parts
 ```
 
-`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
+`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
 
 ## Architecture notes
 
@@ -132,7 +141,7 @@ let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>
 ## Development
 
 ```sh
-cargo test                                   # 175 unit tests (188 with --features stretch, 218 with --all-features); device/network tests are #[ignore]d
+cargo test                                   # 175 unit tests (188 with --features stretch, 230 with --all-features); device/network tests are #[ignore]d
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
