@@ -14,6 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+/// Number of bands in the EQ (both the realtime biquad and the FIR variant).
 pub const EQ_BAND_COUNT: usize = 10;
 
 /// Band centres in Hz, low → high. Mirrors `CENTER_FREQS` on the frontend;

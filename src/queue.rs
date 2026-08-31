@@ -17,8 +17,11 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueEntry {
+    /// The host's stable id for this track.
     pub track_id: i64,
+    /// Path to the audio file on disk.
     pub path: PathBuf,
+    /// Duration, in seconds, as known by the host.
     pub duration_secs: f64,
     /// Normalization gain in dB, resolved when the queue was loaded. Defaulted
     /// so a host that does not track gain can omit it.

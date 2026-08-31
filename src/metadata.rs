@@ -33,7 +33,9 @@ pub const LOSSLESS_EXTENSIONS: &[&str] = &["flac", "wav", "aif", "aiff"];
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverArt {
+    /// The image's MIME type (e.g. `"image/jpeg"`).
     pub mime: String,
+    /// The raw image bytes, base64-encoded.
     pub data_base64: String,
 }
 
@@ -41,26 +43,47 @@ pub struct CoverArt {
 /// this into its own track storage.
 #[derive(Clone, Debug)]
 pub struct Metadata {
+    /// Track title; falls back to the file stem when the file carries none.
     pub title: String,
+    /// Track artist.
     pub artist: Option<String>,
+    /// Album name.
     pub album: Option<String>,
+    /// Composer, when tagged separately from the artist.
     pub composer: Option<String>,
+    /// Duration, in seconds, from the file's audio properties.
     pub duration_secs: f64,
+    /// Human-readable format/codec name (e.g. `"FLAC"`).
     pub format: String,
+    /// Sample rate in Hz, when the container reports one.
     pub sample_rate: Option<u32>,
+    /// Bits per sample, when the container reports one.
     pub bit_depth: Option<u8>,
+    /// Channel count, when the container reports one.
     pub channels: Option<u8>,
+    /// Whether the container format is lossless — see [`LOSSLESS_EXTENSIONS`].
     pub lossless: bool,
+    /// Track number within the disc/album.
     pub track_number: Option<u32>,
+    /// Total track count on the disc/album, when tagged.
     pub track_total: Option<u32>,
+    /// Disc number, for multi-disc albums.
     pub disc_number: Option<u32>,
+    /// Total disc count, when tagged.
     pub disc_total: Option<u32>,
+    /// Release year.
     pub year: Option<u32>,
+    /// Genre.
     pub genre: Option<String>,
+    /// Album artist, when distinct from the track artist (e.g. compilations).
     pub album_artist: Option<String>,
+    /// ReplayGain track gain, in dB, when tagged.
     pub rg_track_gain_db: Option<f64>,
+    /// ReplayGain track peak (linear, `1.0` = 0 dBFS), when tagged.
     pub rg_track_peak: Option<f64>,
+    /// ReplayGain album gain, in dB, when tagged.
     pub rg_album_gain_db: Option<f64>,
+    /// ReplayGain album peak (linear, `1.0` = 0 dBFS), when tagged.
     pub rg_album_peak: Option<f64>,
 }
 

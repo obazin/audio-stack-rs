@@ -80,7 +80,9 @@ pub use queue::QueueEntry;
 /// Both methods are called from the engine thread and must not block it; a
 /// dropped frame is invisible, a stalled send is audible.
 pub trait EventSink: Send + Sync {
+    /// Delivers one transport/state event.
     fn send_event(&self, event: EngineEvent);
+    /// Delivers one visual frame (`FRAME_BYTES` bytes) at ~60 Hz.
     fn send_frame(&self, frame: &[u8]);
 }
 
@@ -149,45 +151,60 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Resumes/starts playback of the current queue entry.
     pub fn play(&self) {
         let _ = self.send(EngineCommand::Play);
     }
+    /// Pauses playback; the queue position is unchanged.
     pub fn pause(&self) {
         let _ = self.send(EngineCommand::Pause);
     }
+    /// Toggles between [`play`](Self::play) and [`pause`](Self::pause).
     pub fn toggle(&self) {
         let _ = self.send(EngineCommand::Toggle);
     }
+    /// Stops playback and releases the output device.
     pub fn stop(&self) {
         let _ = self.send(EngineCommand::Stop);
     }
+    /// Advances to the next queue entry, honoring repeat/shuffle.
     pub fn next(&self) {
         let _ = self.send(EngineCommand::Next);
     }
+    /// Returns to the previous queue entry, or restarts the current one if
+    /// far enough into it.
     pub fn previous(&self) {
         let _ = self.send(EngineCommand::Previous);
     }
+    /// Jumps directly to the queue entry at `index`.
     pub fn jump_to(&self, index: usize) {
         let _ = self.send(EngineCommand::JumpTo(index));
     }
+    /// Seeks the current track to `position_secs`.
     pub fn seek(&self, position_secs: f64) {
         let _ = self.send(EngineCommand::Seek(position_secs));
     }
+    /// Enables/disables shuffled queue order.
     pub fn set_shuffle(&self, enabled: bool) {
         let _ = self.send(EngineCommand::SetShuffle(enabled));
     }
+    /// Enables/disables repeat of the queue.
     pub fn set_repeat(&self, enabled: bool) {
         let _ = self.send(EngineCommand::SetRepeat(enabled));
     }
+    /// Enables/disables EBU R128 loudness normalization.
     pub fn set_normalize(&self, enabled: bool) {
         let _ = self.send(EngineCommand::SetNormalize(enabled));
     }
+    /// Enables/disables gapless playback between queue entries.
     pub fn set_gapless(&self, enabled: bool) {
         let _ = self.send(EngineCommand::SetGapless(enabled));
     }
+    /// Enables/disables crossfading between queue entries.
     pub fn set_crossfade(&self, enabled: bool) {
         let _ = self.send(EngineCommand::SetCrossfade(enabled));
     }
+    /// Switches output to `device_id`, or the system default when `None`.
     pub fn set_device(&self, device_id: Option<String>) {
         let _ = self.send(EngineCommand::SetDevice(device_id));
     }

@@ -24,7 +24,9 @@ use super::params::Params;
 pub struct AudioDevice {
     /// The device name, which doubles as its stable identifier.
     pub id: String,
+    /// Human-readable device name, as reported by the OS.
     pub name: String,
+    /// Whether this is the system's default output device.
     pub is_default: bool,
 }
 
