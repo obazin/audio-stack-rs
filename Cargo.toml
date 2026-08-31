@@ -30,12 +30,26 @@ stretch = ["dep:timestretch"]
 # (it reuses the `realfft` the analyser already links), so feature-off builds
 # are byte-identical.
 fir-eq = []
+# Convolution reverb / impulse-response effect: the host supplies an IR file
+# (reverb, room/headphone correction, per-channel filtering), decoded and
+# resampled to the device rate and applied in the decode-thread effect chain
+# via `AudioEngine::set_convolution`. Pure code, no new dependency (it reuses
+# the symphonia/rubato/realfft the stack already links), so feature-off builds
+# are byte-identical.
+convolution = []
 
 # Audible time-stretch walkthrough: synthesizes a copyright-free clip and
 # steps the tempo live. `cargo run --example time_stretch --features stretch`.
 [[example]]
 name = "time_stretch"
 required-features = ["stretch"]
+
+# Audible convolution walkthrough: synthesizes a dry clip and a short reverb
+# impulse response, then plays dry → wet.
+# `cargo run --example convolution --features convolution`.
+[[example]]
+name = "convolution"
+required-features = ["convolution"]
 
 [dependencies]
 # ── Output + decode + DSP ────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ It was extracted from the [Janis](https://github.com/obazin/janis) desktop playe
 - **Web radio** — an HTTP stream buffered into the same decode path as a local file, with automatic reconnect/backoff, Icecast/Shoutcast ICY titles, and pluggable now-playing providers (SomaFM, Radio France, Radio Paradise) whose cover art is fetched over an https host allowlist.
 - **Time-stretch** *(opt-in `stretch` feature)* — live tempo control (0.25×–2×) with pitch preserved, toggled and adjusted during playback without a click via an effect chain in the decode path. The playhead stays correct while stretched.
 - **Linear-phase EQ** *(opt-in `fir-eq` feature)* — a mastering-style FIR EQ (the same ten bands as the realtime biquad EQ) with no inter-band phase distortion, run in the decode-path effect chain and toggled live without a click. Trades ~43 ms of latency for constant group delay; while on it takes over from the realtime EQ so the two never stack.
+- **Convolution reverb** *(opt-in `convolution` feature)* — a generic impulse-response effect (reverb, room/headphone correction, per-channel filtering): the host supplies an IR file, decoded and resampled to the device rate, applied in the decode-path effect chain with an equal-power wet/dry mix. Uniformly-partitioned frequency-domain convolution, causal (no added latency), IRs capped at ten seconds.
 - **Live analyser** — a compact 170-byte visual frame (160 waveform points + 10 spectrum bands) pushed at ~60 Hz.
 - **Metadata parsing** — tag, audio-property, and embedded-cover reading via [lofty](https://crates.io/crates/lofty), plus filename-based track-number recovery. Pure functions returning plain data; you own the database.
 
@@ -52,6 +53,14 @@ audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1
   ```toml
   audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", features = ["fir-eq"] }
   ```
+
+- **`convolution`** *(opt-in)* — a convolution (impulse-response) effect via `AudioEngine::set_convolution`: reverb, room/headphone correction, or per-channel filtering from any decodable IR file, with an equal-power wet/dry mix. The IR is decoded and resampled to the device rate on load; it is applied causally (no added latency) in the decode-path effect chain, and capped at ten seconds. Pure Rust, reusing the symphonia/rubato/realfft the stack already links, so it adds no new dependency:
+
+  ```toml
+  audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", features = ["convolution"] }
+  ```
+
+  Hear it without writing a host: `cargo run --example convolution --features convolution` synthesizes a dry clip and a reverb IR and sweeps the mix dry → wet (pass an IR file path to use a real space instead).
 
 ## Usage
 
@@ -105,7 +114,7 @@ let meta  = audio_stack_rs::read_metadata(std::path::Path::new("/music/track.fla
 let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>, base64 data URL parts
 ```
 
-`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
+`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
 
 ## Architecture notes
 
@@ -116,7 +125,7 @@ let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>
 ## Development
 
 ```sh
-cargo test                                   # 174 unit tests (187 with --features stretch, 199 with --all-features); device/network tests are #[ignore]d
+cargo test                                   # 175 unit tests (188 with --features stretch, 210 with --all-features); device/network tests are #[ignore]d
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

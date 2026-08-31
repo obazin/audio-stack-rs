@@ -533,6 +533,53 @@ impl Chain {
             .map(|e| (e.enabled(), e.latency_secs(rate)))
             .unwrap_or((false, 0.0))
     }
+
+    /// Enables/disables the convolution effect and sets its IR and mix, creating
+    /// or retiring the effect as needed. Loading a bad IR returns the error and
+    /// leaves the effect bypassed. Mirrors [`Chain::set_time_stretch`].
+    #[cfg(feature = "convolution")]
+    pub fn set_convolution(
+        &mut self,
+        enabled: bool,
+        ir_path: Option<std::path::PathBuf>,
+        mix: f32,
+    ) -> Result<(), String> {
+        use super::convolution::Convolution;
+        let existing = self
+            .effects
+            .iter_mut()
+            .find_map(|e| e.as_any_mut().downcast_mut::<Convolution>());
+        match existing {
+            Some(effect) => {
+                effect.set(enabled, ir_path, mix)?;
+                if enabled && effect.is_bypassed() && self.rate > 0 && self.channels > 0 {
+                    effect.reconfigure(self.rate, self.channels)?;
+                }
+            }
+            None if enabled => {
+                let mut effect = Convolution::new();
+                effect.set(true, ir_path, mix)?;
+                if self.rate > 0 && self.channels > 0 {
+                    effect.reconfigure(self.rate, self.channels)?;
+                }
+                self.effects.push(Box::new(effect));
+            }
+            None => {}
+        }
+        self.effects.retain(|e| e.is_active());
+        Ok(())
+    }
+
+    /// The current convolution setting, for the event echo and `describe`.
+    #[cfg(feature = "convolution")]
+    pub fn convolution(&mut self) -> (bool, f32) {
+        use super::convolution::Convolution;
+        self.effects
+            .iter_mut()
+            .find_map(|e| e.as_any_mut().downcast_mut::<Convolution>())
+            .map(|e| e.setting())
+            .unwrap_or((false, 0.0))
+    }
 }
 
 #[cfg(test)]

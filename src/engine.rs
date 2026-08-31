@@ -101,6 +101,15 @@ pub enum EngineCommand {
     SetFirEq {
         enabled: bool,
     },
+    /// Enables/disables the convolution effect and sets its impulse response
+    /// and wet/dry mix. The IR file is decoded and resampled on load; a failure
+    /// surfaces as `EngineEvent::Error` and leaves the effect bypassed.
+    #[cfg(feature = "convolution")]
+    SetConvolution {
+        enabled: bool,
+        ir_path: Option<std::path::PathBuf>,
+        mix: f32,
+    },
     /// A now-playing poller reporting what a station is playing. Carries the
     /// epoch it started under so a late answer about a station the listener
     /// has already left is discarded.
@@ -503,6 +512,28 @@ impl Engine {
                     latency_secs,
                 });
             }
+            #[cfg(feature = "convolution")]
+            EngineCommand::SetConvolution {
+                enabled,
+                ir_path,
+                mix,
+            } => {
+                if let Err(message) = self.chain.set_convolution(enabled, ir_path.clone(), mix) {
+                    self.emit(EngineEvent::Error { message });
+                }
+                // A crossfade's incoming track mirrors the setting.
+                if let Some(transition) = self.transition.as_mut() {
+                    if let Err(message) =
+                        transition
+                            .chain
+                            .set_convolution(enabled, ir_path.clone(), mix)
+                    {
+                        self.emit(EngineEvent::Error { message });
+                    }
+                }
+                let (enabled, mix) = self.chain.convolution();
+                self.emit(EngineEvent::Convolution { enabled, mix });
+            }
             EngineCommand::SetDevice(id) => {
                 self.device_id = id;
                 // Rebuilding the stream is the only way to change device, and
@@ -729,6 +760,11 @@ impl Engine {
                 enabled,
                 latency_secs,
             });
+        }
+        #[cfg(feature = "convolution")]
+        {
+            let (enabled, mix) = self.chain.convolution();
+            self.emit(EngineEvent::Convolution { enabled, mix });
         }
         // Before `State`, whose index refers into this queue. The `State`
         // event alone cannot rebuild a reloaded webview's track list.
@@ -1744,10 +1780,10 @@ mod tests {
     }
 
     /// Collects emitted events, for the tests that assert on the echo.
-    #[cfg(any(feature = "stretch", feature = "fir-eq"))]
+    #[cfg(any(feature = "stretch", feature = "fir-eq", feature = "convolution"))]
     struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
 
-    #[cfg(any(feature = "stretch", feature = "fir-eq"))]
+    #[cfg(any(feature = "stretch", feature = "fir-eq", feature = "convolution"))]
     impl crate::EventSink for CaptureSink {
         fn send_event(&self, event: EngineEvent) {
             self.0.lock().unwrap().push(event);
@@ -1755,7 +1791,7 @@ mod tests {
         fn send_frame(&self, _frame: &[u8]) {}
     }
 
-    #[cfg(any(feature = "stretch", feature = "fir-eq"))]
+    #[cfg(any(feature = "stretch", feature = "fir-eq", feature = "convolution"))]
     fn captured_engine() -> (Engine, Arc<CaptureSink>) {
         let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1876,6 +1912,81 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, EngineEvent::FirEq { enabled: true, .. })),
+            "a reloaded UI must recover the setting from describe()"
+        );
+    }
+
+    #[cfg(feature = "convolution")]
+    fn write_delta_ir() -> std::path::PathBuf {
+        // A one-sample unit-impulse IR, enough to build a backend from.
+        let bytes = fixtures::wav_bytes(48_000, 1, &[i16::MAX]);
+        let path = std::env::temp_dir().join("audio-stack-rs-engine-conv-ir.wav");
+        std::fs::write(&path, bytes).expect("write ir");
+        path
+    }
+
+    #[cfg(feature = "convolution")]
+    #[test]
+    fn set_convolution_echoes_the_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetConvolution {
+            enabled: true,
+            ir_path: Some(write_delta_ir()),
+            mix: 0.4,
+        });
+
+        let events = sink.0.lock().unwrap();
+        let echoed = events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::Convolution { enabled, mix } => Some((*enabled, *mix)),
+                _ => None,
+            })
+            .expect("the setting must be echoed");
+        assert!(echoed.0, "enabling must be echoed as enabled");
+        assert!(
+            (echoed.1 - 0.4).abs() < 1e-6,
+            "and carry the mix: {}",
+            echoed.1
+        );
+    }
+
+    #[cfg(feature = "convolution")]
+    #[test]
+    fn a_bad_ir_surfaces_an_error_and_leaves_convolution_off() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetConvolution {
+            enabled: true,
+            ir_path: Some(std::path::PathBuf::from("/no/such/impulse.wav")),
+            mix: 0.5,
+        });
+
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Error { .. })),
+            "a missing IR must surface an error"
+        );
+    }
+
+    #[cfg(feature = "convolution")]
+    #[test]
+    fn describe_recovers_the_convolution_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetConvolution {
+            enabled: true,
+            ir_path: Some(write_delta_ir()),
+            mix: 0.6,
+        });
+        sink.0.lock().unwrap().clear();
+
+        engine.describe();
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Convolution { enabled: true, .. })),
             "a reloaded UI must recover the setting from describe()"
         );
     }

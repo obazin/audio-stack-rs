@@ -94,6 +94,11 @@ pub enum EngineEvent {
     #[cfg(feature = "fir-eq")]
     #[serde(rename_all = "camelCase")]
     FirEq { enabled: bool, latency_secs: f32 },
+    /// The convolution effect setting, echoed on every change and on subscribe
+    /// so a reloaded UI recovers it. `mix` is the wet/dry blend (0 dry … 1 wet).
+    #[cfg(feature = "convolution")]
+    #[serde(rename_all = "camelCase")]
+    Convolution { enabled: bool, mix: f32 },
     /// Playback failed. Non-fatal: the engine stays alive and idle.
     #[serde(rename_all = "camelCase")]
     Error { message: String },
@@ -159,6 +164,18 @@ mod tests {
         assert!(encoded.contains(r#""event":"firEq""#), "{encoded}");
         assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
         assert!(encoded.contains(r#""latencySecs":0.0427"#), "{encoded}");
+    }
+
+    #[cfg(feature = "convolution")]
+    #[test]
+    fn convolution_event_is_tagged_and_camel_cased() {
+        let encoded = json(&EngineEvent::Convolution {
+            enabled: true,
+            mix: 0.5,
+        });
+        assert!(encoded.contains(r#""event":"convolution""#), "{encoded}");
+        assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
+        assert!(encoded.contains(r#""mix":0.5"#), "{encoded}");
     }
 
     #[test]

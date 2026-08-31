@@ -21,6 +21,8 @@
 mod analyser;
 mod chain;
 mod codecs;
+#[cfg(feature = "convolution")]
+mod convolution;
 mod decode;
 mod dsp;
 mod engine;
@@ -207,6 +209,23 @@ impl AudioEngine {
     #[cfg(feature = "fir-eq")]
     pub fn set_fir_eq(&self, enabled: bool) {
         let _ = self.send(EngineCommand::SetFirEq { enabled });
+    }
+
+    /// Enables/disables the convolution (impulse-response) effect and sets its
+    /// IR and wet/dry mix (0.0 dry … 1.0 fully wet, equal-power). `ir_path` is
+    /// any decodable audio file — a reverb, room/headphone-correction, or
+    /// per-channel-filter IR; a mono IR applies to every channel, a stereo IR
+    /// per channel. The file is decoded and resampled to the device rate on
+    /// load; a load failure arrives as [`EngineEvent::Error`] and leaves the
+    /// effect bypassed. Echoed as [`EngineEvent::Convolution`]. IRs are capped
+    /// at ten seconds.
+    #[cfg(feature = "convolution")]
+    pub fn set_convolution(&self, enabled: bool, ir_path: Option<std::path::PathBuf>, mix: f32) {
+        let _ = self.send(EngineCommand::SetConvolution {
+            enabled,
+            ir_path,
+            mix,
+        });
     }
 
     /// Re-emit everything the host needs to render current state. Call after a
