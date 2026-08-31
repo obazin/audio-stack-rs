@@ -92,6 +92,8 @@ Every effect phase plugs into the existing `Chain` (`src/chain.rs`) and therefor
 
 ## Phase 5 — Decode-thread music analysis (feature `analysis`)
 
+> **Status update (2026-08-31): BPM/key (tasks 2–4) landed; silence/padding trim (task 1) deferred.** The tempo and key analysis is implemented behind the `analysis` feature — the STFT tap, the two estimators, and the `EngineEvent::TrackAnalysis` event, on the loudness meter's lifecycle (events only, no `Store` hook). The gapless silence/padding trim (task 1) was **deferred** at review: its stated trim point is wrong. `advance_or_stop` runs only when `pending_out.is_empty()` (`exhausted = decoder.is_exhausted() && pending_out.is_empty()`), so the outgoing silent tail has already been pushed to the ring by then — there is nothing to trim there. Doing it correctly needs a *silence hold-back* in the core pump loop (a trailing-silence run spans several pump buffers; the earlier ones are ringed before exhaustion is known — so silent runs must be held and dropped only into a gapless join), which is surgery on the delicate, heavily-tested pump/ring/`frames_written`/timeline path, and the incoming lead-in skip is similarly entangled (no seek to an unknown offset — decode-then-detect, shifting the boundary/position math). It also partly overlaps symphonia's own encoder-delay/padding trimming for formats that carry gapless metadata. Left as a tracked follow-up rather than risking the core playback loop; see the project memory.
+
 **Goal:** put the decode thread's free access to every sample to work: trim encoder padding for truly gapless joins, and surface BPM/key to hosts.
 
 **Files:** `src/analysis.rs` (new, gated), `src/engine.rs` (two small non-chain touchpoints, named below), `src/events.rs`, README.
