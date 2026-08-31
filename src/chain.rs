@@ -549,25 +549,35 @@ impl Chain {
             .effects
             .iter_mut()
             .find_map(|e| e.as_any_mut().downcast_mut::<Convolution>());
+        // A failed IR load disables the effect, so the retain below must still
+        // run to retire it — collect the error rather than returning past it.
+        let mut result = Ok(());
         match existing {
             Some(effect) => {
-                effect.set(enabled, ir_path, mix)?;
-                if enabled && effect.is_bypassed() && self.rate > 0 && self.channels > 0 {
-                    effect.reconfigure(self.rate, self.channels)?;
+                result = effect.set(enabled, ir_path, mix);
+                if result.is_ok()
+                    && enabled
+                    && effect.is_bypassed()
+                    && self.rate > 0
+                    && self.channels > 0
+                {
+                    result = effect.reconfigure(self.rate, self.channels);
                 }
             }
             None if enabled => {
                 let mut effect = Convolution::new();
-                effect.set(true, ir_path, mix)?;
-                if self.rate > 0 && self.channels > 0 {
-                    effect.reconfigure(self.rate, self.channels)?;
+                result = effect.set(true, ir_path, mix);
+                if result.is_ok() && self.rate > 0 && self.channels > 0 {
+                    result = effect.reconfigure(self.rate, self.channels);
                 }
-                self.effects.push(Box::new(effect));
+                if result.is_ok() {
+                    self.effects.push(Box::new(effect));
+                }
             }
             None => {}
         }
         self.effects.retain(|e| e.is_active());
-        Ok(())
+        result
     }
 
     /// The current convolution setting, for the event echo and `describe`.

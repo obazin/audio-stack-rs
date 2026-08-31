@@ -2004,11 +2004,13 @@ mod tests {
         );
     }
 
+    /// Writes a one-sample unit-impulse IR, enough to build a backend from.
+    /// `name` must be unique per test: tests run in parallel threads, and a
+    /// shared path would race a truncating write against a read.
     #[cfg(feature = "convolution")]
-    fn write_delta_ir() -> std::path::PathBuf {
-        // A one-sample unit-impulse IR, enough to build a backend from.
+    fn write_delta_ir(name: &str) -> std::path::PathBuf {
         let bytes = fixtures::wav_bytes(48_000, 1, &[i16::MAX]);
-        let path = std::env::temp_dir().join("audio-stack-rs-engine-conv-ir.wav");
+        let path = std::env::temp_dir().join(format!("audio-stack-rs-engine-conv-{name}.wav"));
         std::fs::write(&path, bytes).expect("write ir");
         path
     }
@@ -2019,7 +2021,7 @@ mod tests {
         let (mut engine, sink) = captured_engine();
         engine.handle(EngineCommand::SetConvolution {
             enabled: true,
-            ir_path: Some(write_delta_ir()),
+            ir_path: Some(write_delta_ir("echo-setting")),
             mix: 0.4,
         });
 
@@ -2060,11 +2062,47 @@ mod tests {
 
     #[cfg(feature = "convolution")]
     #[test]
+    fn a_failed_ir_swap_echoes_disabled_not_enabled() {
+        // Replacing a working IR with a bad file surfaces the error, and the
+        // echo that follows must say disabled — not claim an IR that never
+        // loaded.
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetConvolution {
+            enabled: true,
+            ir_path: Some(write_delta_ir("failed-swap")),
+            mix: 0.5,
+        });
+        sink.0.lock().unwrap().clear();
+
+        engine.handle(EngineCommand::SetConvolution {
+            enabled: true,
+            ir_path: Some(std::path::PathBuf::from("/no/such/replacement.wav")),
+            mix: 0.5,
+        });
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Error { .. })),
+            "the failed load must surface an error"
+        );
+        let echoed = events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::Convolution { enabled, .. } => Some(*enabled),
+                _ => None,
+            })
+            .expect("the setting must still be echoed");
+        assert!(!echoed, "the echo must report disabled after a failed swap");
+    }
+
+    #[cfg(feature = "convolution")]
+    #[test]
     fn describe_recovers_the_convolution_setting() {
         let (mut engine, sink) = captured_engine();
         engine.handle(EngineCommand::SetConvolution {
             enabled: true,
-            ir_path: Some(write_delta_ir()),
+            ir_path: Some(write_delta_ir("describe")),
             mix: 0.6,
         });
         sink.0.lock().unwrap().clear();

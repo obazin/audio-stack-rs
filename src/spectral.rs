@@ -27,22 +27,10 @@ use std::sync::Arc;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
-/// Uniformly-partitioned frequency-domain convolution (overlap-save).
-///
-/// The kernel is split into `block`-sample partitions, each transformed once
-/// at construction. Input is transformed a block at a time with a size-`2·block`
-/// FFT; the block spectra are kept in a ring (the FDL) and multiply-accumulated
-/// against the partitioned kernel, so a kernel of any length costs one forward
-/// and one inverse FFT per block regardless of how many partitions it spans.
-///
-/// Streaming: `process` stages input that does not fill a whole block, exactly
-/// as [`Resampler`](super::resample::Resampler) does, and emits whole blocks;
-/// `drain` flushes the staged remainder and the `kernel_len − 1` tail, so a
-/// stream's total output is `input_len + kernel_len − 1` frames — the length of
-/// the full linear convolution.
 /// The immutable, transformed side of a convolution: the partitioned kernel
-/// spectra and the FFT plans, all shareable. Building it FFTs the kernel once;
-/// wrapping it in an `Arc` lets many [`Convolver`]s — one per channel, plus a
+/// spectra and the FFT plans, all shareable. The kernel is split into
+/// `block`-sample partitions, each transformed once at construction; wrapping
+/// the result in an `Arc` lets many [`Convolver`]s — one per channel, plus a
 /// crossfade's mirror — share that work instead of each re-transforming a large
 /// impulse response.
 pub struct Kernel {
@@ -113,11 +101,23 @@ impl Kernel {
     }
 }
 
-/// Streaming uniformly-partitioned convolution against a shared [`Kernel`].
+/// Streaming uniformly-partitioned convolution (overlap-save) against a shared
+/// [`Kernel`].
+///
+/// Input is transformed a block at a time with a size-`2·block` FFT; the block
+/// spectra are kept in a ring (the FDL) and multiply-accumulated against the
+/// partitioned kernel, so a kernel of any length costs one forward and one
+/// inverse FFT per block regardless of how many partitions it spans.
+///
+/// Streaming: `process` stages input that does not fill a whole block, exactly
+/// as [`Resampler`](super::resample::Resampler) does, and emits whole blocks;
+/// `drain` flushes the staged remainder and the `kernel_len − 1` tail, so a
+/// stream's total output is `input_len + kernel_len − 1` frames — the length of
+/// the full linear convolution.
 ///
 /// Holds only the per-stream mutable state (the FDL, staging, scratch); the
-/// transformed kernel lives behind an `Arc`, so [`spawn`](Self::spawn) makes a
-/// fresh, independent convolver over the same impulse response for free.
+/// transformed kernel lives behind an `Arc`, so [`from_kernel`](Self::from_kernel)
+/// makes a fresh, independent convolver over the same impulse response for free.
 pub struct Convolver {
     kernel: Arc<Kernel>,
     /// Frequency-domain delay line: the last `partitions` input-block spectra,
@@ -312,8 +312,9 @@ pub struct StereoConvolver {
     /// The most recent whole-block input, up to `warmup_frames`, for priming a
     /// freshly-swapped kernel to steady state.
     history: Vec<f32>,
-    /// How many recent frames of `history` to keep and prime with — a kernel
-    /// length rounded up to a whole block.
+    /// How many recent frames of `history` to keep and prime with — the
+    /// longest kernel seen so far, rounded up to a whole block (a high-water
+    /// mark, so a swap back to a long kernel is still fully primed).
     warmup_frames: usize,
     /// Deinterleaved whole-block input and per-channel outputs, reused per call.
     channel_in: Vec<Vec<f32>>,
@@ -351,6 +352,12 @@ impl StereoConvolver {
     /// and silent through their group delay — when the blend starts. A swap
     /// requested while another is still fading restarts the crossfade from the
     /// active kernel to this newest one, discarding the previous incoming one.
+    ///
+    /// Priming can only use history that was retained, so the first swap to a
+    /// kernel longer than any seen before starts its deepest partitions cold —
+    /// the response settles within one kernel length, with no click (the
+    /// crossfade covers it). Retention then keeps that high-water mark, so
+    /// every later swap — including back to the long kernel — is fully primed.
     pub fn set_kernel(&mut self, kernel: &[f32]) {
         let channels = self.channels;
         let shared = Arc::new(Kernel::new(kernel, self.block));
@@ -370,7 +377,11 @@ impl StereoConvolver {
         }
         self.next = Some(next);
         self.fade_pos = 0;
-        self.warmup_frames = kernel.len().div_ceil(self.block) * self.block;
+        // High-water mark, never shrunk: a later swap back to the longest
+        // kernel seen must still find enough history to prime with.
+        self.warmup_frames = self
+            .warmup_frames
+            .max(kernel.len().div_ceil(self.block) * self.block);
     }
 
     /// Convolves interleaved `input`, appending interleaved result to `output`.
@@ -492,6 +503,12 @@ impl StereoConvolver {
     /// Latency the convolvers add: none (see [`Convolver::latency_frames`]).
     pub fn latency_frames(&self) -> usize {
         0
+    }
+
+    /// Frames staged awaiting a whole block — input accepted but not yet
+    /// emitted, which an owner reporting buffered frames must count.
+    pub fn staged_frames(&self) -> usize {
+        self.stage.len() / self.channels
     }
 }
 
@@ -891,6 +908,23 @@ mod tests {
         let sum: f32 = kernel.iter().sum();
         kernel.iter_mut().for_each(|k| *k /= sum); // unity DC gain
         kernel
+    }
+
+    #[test]
+    fn warmup_retention_keeps_its_high_water_mark() {
+        // Swapping to a short kernel must not shrink the retained history: a
+        // later swap back to a long kernel still needs a full kernel length of
+        // recent input to prime with.
+        let long = noise(BLOCK * 3, 13);
+        let mut convolver = StereoConvolver::new(&long, BLOCK, 1);
+        let retained = convolver.warmup_frames;
+        assert_eq!(retained, BLOCK * 3, "retention starts at the kernel length");
+
+        convolver.set_kernel(&[1.0]);
+        assert_eq!(
+            convolver.warmup_frames, retained,
+            "a shorter kernel keeps the high-water retention"
+        );
     }
 
     #[test]

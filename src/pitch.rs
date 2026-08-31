@@ -11,7 +11,10 @@
 //! `2^(cents/1200)` (analysis at a fixed hop, synthesis at a scaled hop, with
 //! per-bin instantaneous-frequency phase accumulation), then a linear resample
 //! by the same factor compresses it back to the original length — the net is a
-//! pitch shift at constant duration. Latency is one FFT window.
+//! pitch shift at constant duration. Latency is one FFT window. The synthesis
+//! hop is rounded to whole samples, so the realized ratio is quantized in
+//! steps of `1/512` (the analysis hop) — the shift lands within ~±1.7 cents
+//! of the request, below the ~5-cent audibility threshold.
 //!
 //! Off is structural, like [`TimeStretch`](super::stretch): a disabled shifter
 //! ramps to 0 cents and stays warm until the next chain reset drops its

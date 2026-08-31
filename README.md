@@ -141,7 +141,7 @@ let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>
 ## Development
 
 ```sh
-cargo test                                   # 175 unit tests (188 with --features stretch, 230 with --all-features); device/network tests are #[ignore]d
+cargo test                                   # 176 unit tests (189 with --features stretch, 235 with --all-features); device/network tests are #[ignore]d
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

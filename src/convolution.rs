@@ -92,20 +92,34 @@ impl Convolution {
     }
 
     /// Applies the user's setting. Loading a new IR path decodes the file (and
-    /// may fail — a bad file leaves the effect bypassed and returns the error);
-    /// an unchanged path is not re-decoded. The backend is (re)built lazily by
-    /// [`reconfigure`](Effect::reconfigure) once the device shape is known.
+    /// may fail — a bad file leaves the effect disabled and bypassed and
+    /// returns the error, so the event echo never claims an IR that is not
+    /// loaded); an unchanged path is not re-decoded. The backend is (re)built
+    /// lazily by [`reconfigure`](Effect::reconfigure) once the device shape is
+    /// known.
     pub fn set(&mut self, enabled: bool, ir_path: Option<PathBuf>, mix: f32) -> Result<(), String> {
-        self.enabled = enabled;
         self.mix = mix.clamp(0.0, 1.0);
         if ir_path != self.ir_path {
-            self.ir_path = ir_path.clone();
             self.backend = None;
             self.source_ir = None; // bypassed until a load succeeds
             if let Some(path) = &ir_path {
-                self.source_ir = Some(Arc::new(load_source_ir(path)?));
+                match load_source_ir(path) {
+                    Ok(source) => self.source_ir = Some(Arc::new(source)),
+                    Err(message) => {
+                        // The old IR is already dropped (the user asked to
+                        // replace it) and none was loaded: recording `enabled`
+                        // here would echo "on" with nothing behind it. A failed
+                        // load leaves the effect off, and the path unset so a
+                        // retry of the same file is attempted, not skipped.
+                        self.enabled = false;
+                        self.ir_path = None;
+                        return Err(message);
+                    }
+                }
             }
+            self.ir_path = ir_path;
         }
+        self.enabled = enabled;
         Ok(())
     }
 
@@ -171,7 +185,12 @@ impl Effect for Convolution {
     }
 
     fn pending_output_frames(&self) -> u64 {
-        0 // causal: the wet aligns with the dry, no added latency
+        // Causal — the wet aligns with the dry, no group delay — but input
+        // staged awaiting a whole block has been accepted and not yet emitted,
+        // and a gapless boundary must sit past it.
+        self.backend
+            .as_ref()
+            .map_or(0, |backend| (backend.stage.len() / backend.channels) as u64)
     }
 
     fn matches(&self, rate: u32, channels: usize) -> bool {
@@ -524,6 +543,53 @@ mod tests {
         let out = run(&mut effect, &input);
         assert!((out[20] - 1.0).abs() < 1e-3, "left passes: {}", out[20]);
         assert!((out[21] - 0.5).abs() < 1e-3, "right halves: {}", out[21]);
+    }
+
+    #[test]
+    fn staged_input_counts_as_pending_output() {
+        // Sub-block input is accepted but not yet emitted; a gapless boundary
+        // must sit past it, so it has to be reported as pending.
+        let path = ir_file("staged", RATE, 1, &[1.0]);
+        let mut effect = enabled_with(path, 1.0, 1);
+        assert_eq!(
+            effect.pending_output_frames(),
+            0,
+            "fresh effect holds nothing"
+        );
+
+        let mut out = Vec::new();
+        effect.process(&noise(BLOCK / 2, 4), &mut out).unwrap();
+        assert_eq!(
+            effect.pending_output_frames(),
+            (BLOCK / 2) as u64,
+            "half a block in, nothing out: all of it is pending"
+        );
+
+        effect.process(&noise(BLOCK / 2, 5), &mut out).unwrap();
+        assert_eq!(
+            effect.pending_output_frames(),
+            0,
+            "a whole block has been emitted, the stage is empty"
+        );
+    }
+
+    #[test]
+    fn a_failed_ir_swap_disables_the_effect() {
+        // Replacing a working IR with a bad file drops the old IR, so claiming
+        // "enabled" would echo an IR that is not loaded — the effect must come
+        // back disabled and bypassed, with the error surfaced.
+        let path = ir_file("swap-good", RATE, 1, &[1.0]);
+        let mut effect = enabled_with(path, 0.8, 1);
+        assert_eq!(effect.setting(), (true, 0.8));
+
+        let missing = std::env::temp_dir().join("audio-stack-rs-conv-swap-missing.wav");
+        let result = effect.set(true, Some(missing), 0.8);
+        assert!(result.is_err(), "a missing replacement IR must error");
+        assert!(
+            !effect.setting().0,
+            "a failed swap must not leave the effect claiming to be enabled"
+        );
+        assert!(effect.is_bypassed(), "and it is bypassed");
     }
 
     #[test]

@@ -180,10 +180,12 @@ impl Effect for FirEq {
     }
 
     fn pending_output_frames(&self) -> u64 {
-        if self.backend.is_some() {
-            LATENCY_FRAMES as u64
-        } else {
-            0
+        // The constant group delay, plus whatever sub-block input the convolver
+        // has staged but not yet emitted — without the latter a gapless
+        // boundary could land up to a block early.
+        match self.backend.as_ref() {
+            Some(backend) => (LATENCY_FRAMES + backend.staged_frames()) as u64,
+            None => 0,
         }
     }
 
@@ -454,5 +456,24 @@ mod tests {
         assert_eq!(effect.pending_output_frames(), LATENCY_FRAMES as u64);
         let expected = LATENCY_FRAMES as f32 / RATE as f32;
         assert!((effect.latency_secs(RATE) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pending_output_counts_the_staged_remainder_too() {
+        // Sub-block input sits in the convolver's stage, accepted but not yet
+        // emitted; a gapless boundary must sit past it as well as the group
+        // delay, so both are reported.
+        let params = Arc::new(Params::default());
+        let mut effect = FirEq::new(Arc::clone(&params));
+        effect.set(true);
+        effect.reconfigure(RATE, 1).unwrap();
+
+        let mut out = Vec::new();
+        effect.process(&vec![0.1f32; 100], &mut out).unwrap();
+        assert_eq!(
+            effect.pending_output_frames(),
+            LATENCY_FRAMES as u64 + 100,
+            "group delay plus the 100 staged frames"
+        );
     }
 }
