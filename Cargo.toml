@@ -37,6 +37,12 @@ fir-eq = []
 # the symphonia/rubato/realfft the stack already links), so feature-off builds
 # are byte-identical.
 convolution = []
+# Decode-thread music analysis: estimates tempo (BPM) and musical key of each
+# fully-heard local track from the samples the decode thread already sees, and
+# surfaces them to the host as `EngineEvent::TrackAnalysis`. Pure code, no new
+# dependency (it reuses the `realfft` the analyser already links), so
+# feature-off builds are byte-identical.
+analysis = []
 
 # Audible time-stretch walkthrough: synthesizes a copyright-free clip and
 # steps the tempo live. `cargo run --example time_stretch --features stretch`.

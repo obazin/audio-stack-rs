@@ -19,6 +19,8 @@
 //!   [`AudioEngine::play_stream`], is driven by the caller's runtime.
 
 mod analyser;
+#[cfg(feature = "analysis")]
+mod analysis;
 mod chain;
 mod codecs;
 #[cfg(feature = "convolution")]

@@ -13,6 +13,7 @@ It was extracted from the [Janis](https://github.com/obazin/janis) desktop playe
 - **Time-stretch** *(opt-in `stretch` feature)* — live tempo control (0.25×–2×) with pitch preserved, toggled and adjusted during playback without a click via an effect chain in the decode path. The playhead stays correct while stretched.
 - **Linear-phase EQ** *(opt-in `fir-eq` feature)* — a mastering-style FIR EQ (the same ten bands as the realtime biquad EQ) with no inter-band phase distortion, run in the decode-path effect chain and toggled live without a click. Trades ~43 ms of latency for constant group delay; while on it takes over from the realtime EQ so the two never stack.
 - **Convolution reverb** *(opt-in `convolution` feature)* — a generic impulse-response effect (reverb, room/headphone correction, per-channel filtering): the host supplies an IR file, decoded and resampled to the device rate, applied in the decode-path effect chain with an equal-power wet/dry mix. Uniformly-partitioned frequency-domain convolution, causal (no added latency), IRs capped at ten seconds.
+- **Music analysis** *(opt-in `analysis` feature)* — estimates tempo (BPM) and musical key of each local track heard end to end, from the samples the decode thread already sees (spectral-flux onset autocorrelation for tempo, Krumhansl–Schmuckler chroma matching for key), and reports them to the host as a `TrackAnalysis` event. Nothing to call: it runs automatically for whole listens.
 - **Live analyser** — a compact 170-byte visual frame (160 waveform points + 10 spectrum bands) pushed at ~60 Hz.
 - **Metadata parsing** — tag, audio-property, and embedded-cover reading via [lofty](https://crates.io/crates/lofty), plus filename-based track-number recovery. Pure functions returning plain data; you own the database.
 
@@ -61,6 +62,12 @@ audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1
   ```
 
   Hear it without writing a host: `cargo run --example convolution --features convolution` synthesizes a dry clip and a reverb IR and sweeps the mix dry → wet (pass an IR file path to use a real space instead).
+
+- **`analysis`** *(opt-in)* — decode-thread tempo (BPM) and key estimation, reported per fully-heard local track as `EngineEvent::TrackAnalysis { track_id, bpm, bpm_confidence, key, key_confidence }`. There is nothing to call — it runs automatically while a track plays and reports when the track finishes (a seek or skip reports nothing). Pure Rust, reusing the `realfft` the analyser already links, so it adds no new dependency:
+
+  ```toml
+  audio-stack-rs = { git = "https://github.com/obazin/audio-stack-rs", tag = "v0.1.0", features = ["analysis"] }
+  ```
 
 ## Usage
 
@@ -125,7 +132,7 @@ let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>
 ## Development
 
 ```sh
-cargo test                                   # 175 unit tests (188 with --features stretch, 210 with --all-features); device/network tests are #[ignore]d
+cargo test                                   # 175 unit tests (188 with --features stretch, 218 with --all-features); device/network tests are #[ignore]d
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

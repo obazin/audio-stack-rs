@@ -99,6 +99,18 @@ pub enum EngineEvent {
     #[cfg(feature = "convolution")]
     #[serde(rename_all = "camelCase")]
     Convolution { enabled: bool, mix: f32 },
+    /// Tempo and key of a track heard end to end, emitted once when it
+    /// finishes. Either estimate is `None` when the track was too short or too
+    /// featureless to judge; the confidences are 0..1.
+    #[cfg(feature = "analysis")]
+    #[serde(rename_all = "camelCase")]
+    TrackAnalysis {
+        track_id: i64,
+        bpm: Option<f32>,
+        bpm_confidence: f32,
+        key: Option<String>,
+        key_confidence: f32,
+    },
     /// Playback failed. Non-fatal: the engine stays alive and idle.
     #[serde(rename_all = "camelCase")]
     Error { message: String },
@@ -176,6 +188,23 @@ mod tests {
         assert!(encoded.contains(r#""event":"convolution""#), "{encoded}");
         assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
         assert!(encoded.contains(r#""mix":0.5"#), "{encoded}");
+    }
+
+    #[cfg(feature = "analysis")]
+    #[test]
+    fn track_analysis_event_is_tagged_and_camel_cased() {
+        let encoded = json(&EngineEvent::TrackAnalysis {
+            track_id: 42,
+            bpm: Some(120.0),
+            bpm_confidence: 0.8,
+            key: Some("C major".into()),
+            key_confidence: 0.6,
+        });
+        assert!(encoded.contains(r#""event":"trackAnalysis""#), "{encoded}");
+        assert!(encoded.contains(r#""trackId":42"#), "{encoded}");
+        assert!(encoded.contains(r#""bpm":120.0"#), "{encoded}");
+        assert!(encoded.contains(r#""bpmConfidence":0.8"#), "{encoded}");
+        assert!(encoded.contains(r#""key":"C major""#), "{encoded}");
     }
 
     #[test]

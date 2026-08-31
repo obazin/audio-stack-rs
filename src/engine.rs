@@ -232,6 +232,11 @@ pub struct Engine {
     /// its own. Abandoned on a seek — a partial listen measures the wrong
     /// thing.
     measuring: Option<(i64, Loudness)>,
+    /// Tempo/key being analysed for the playing local track, on the same
+    /// lifecycle as `measuring` but for every local track (not only untagged
+    /// ones). Abandoned on a seek — a partial listen is not a whole track.
+    #[cfg(feature = "analysis")]
+    analysing: Option<(i64, super::analysis::Analysis)>,
     /// Set when the station has a now-playing provider. The provider is then
     /// the only source: merging it with ICY, which often disagrees about
     /// timing, produces worse answers than either feed alone.
@@ -307,6 +312,8 @@ impl Engine {
             normalize: true,
             current_gain_db: 0.0,
             measuring: None,
+            #[cfg(feature = "analysis")]
+            analysing: None,
             has_provider: false,
             station_epoch,
             resampler: None,
@@ -687,6 +694,10 @@ impl Engine {
     /// end to end fills in its own gain for next time.
     fn start_measuring(&mut self, format: &super::decode::SourceFormat) {
         self.measuring = None;
+        #[cfg(feature = "analysis")]
+        {
+            self.analysing = None;
+        }
         if self.mode != Mode::Local {
             return;
         }
@@ -694,6 +705,13 @@ impl Engine {
             return;
         };
         let track_id = entry.track_id;
+        // Tempo/key run for every local track, so this sits before the
+        // loudness store's needs_measurement gate below.
+        #[cfg(feature = "analysis")]
+        if let Some(analysis) = super::analysis::Analysis::new(format.sample_rate, format.channels)
+        {
+            self.analysing = Some((track_id, analysis));
+        }
         if !self.loudness_store.needs_measurement(track_id) {
             return;
         }
@@ -708,6 +726,22 @@ impl Engine {
     /// instead: a partial listen measures the wrong thing, and a wrong gain
     /// is worse than none.
     fn finish_measuring(&mut self, complete: bool) {
+        // Tempo/key: reported only for a full listen, then the state is dropped
+        // either way (a partial listen is not a whole track).
+        #[cfg(feature = "analysis")]
+        if let Some((track_id, analysis)) = self.analysing.take() {
+            if complete {
+                let result = analysis.finish();
+                self.emit(EngineEvent::TrackAnalysis {
+                    track_id,
+                    bpm: result.bpm,
+                    bpm_confidence: result.bpm_confidence,
+                    key: result.key,
+                    key_confidence: result.key_confidence,
+                });
+            }
+        }
+
         let Some((track_id, meter)) = self.measuring.take() else {
             return;
         };
@@ -862,6 +896,10 @@ impl Engine {
         // Whatever has been measured so far no longer describes a full
         // listen.
         self.measuring = None;
+        #[cfg(feature = "analysis")]
+        {
+            self.analysing = None;
+        }
         match decoder.seek(secs) {
             Ok(landed) => {
                 // Drop everything already decoded past the old position, and
@@ -1095,6 +1133,10 @@ impl Engine {
             // playing through.
             if let Some((_, meter)) = self.measuring.as_mut() {
                 meter.feed(&self.decode_buf[..read]);
+            }
+            #[cfg(feature = "analysis")]
+            if let Some((_, analysis)) = self.analysing.as_mut() {
+                analysis.feed(&self.decode_buf[..read]);
             }
 
             self.mapped_buf.clear();
@@ -1780,10 +1822,20 @@ mod tests {
     }
 
     /// Collects emitted events, for the tests that assert on the echo.
-    #[cfg(any(feature = "stretch", feature = "fir-eq", feature = "convolution"))]
+    #[cfg(any(
+        feature = "stretch",
+        feature = "fir-eq",
+        feature = "convolution",
+        feature = "analysis"
+    ))]
     struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
 
-    #[cfg(any(feature = "stretch", feature = "fir-eq", feature = "convolution"))]
+    #[cfg(any(
+        feature = "stretch",
+        feature = "fir-eq",
+        feature = "convolution",
+        feature = "analysis"
+    ))]
     impl crate::EventSink for CaptureSink {
         fn send_event(&self, event: EngineEvent) {
             self.0.lock().unwrap().push(event);
@@ -1791,7 +1843,12 @@ mod tests {
         fn send_frame(&self, _frame: &[u8]) {}
     }
 
-    #[cfg(any(feature = "stretch", feature = "fir-eq", feature = "convolution"))]
+    #[cfg(any(
+        feature = "stretch",
+        feature = "fir-eq",
+        feature = "convolution",
+        feature = "analysis"
+    ))]
     fn captured_engine() -> (Engine, Arc<CaptureSink>) {
         let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1989,6 +2046,59 @@ mod tests {
                 .any(|e| matches!(e, EngineEvent::Convolution { enabled: true, .. })),
             "a reloaded UI must recover the setting from describe()"
         );
+    }
+
+    #[cfg(feature = "analysis")]
+    #[test]
+    fn a_full_listen_emits_a_track_analysis() {
+        let (mut engine, sink) = captured_engine();
+        // Arm analysis by hand for track 7 and feed it a click track, the way
+        // the pump would while it played.
+        let mut analysis = super::super::analysis::Analysis::new(44_100, 2).expect("analysis");
+        let click: Vec<f32> = (0..44_100 * 8)
+            .flat_map(|n| {
+                let period = 44_100 / 2; // 120 BPM
+                let s = if n % period < 200 { 0.8 } else { 0.0 };
+                [s, s]
+            })
+            .collect();
+        analysis.feed(&click);
+        engine.analysing = Some((7, analysis));
+
+        engine.finish_measuring(true);
+        let events = sink.0.lock().unwrap();
+        let reported = events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::TrackAnalysis { track_id, bpm, .. } => Some((*track_id, *bpm)),
+                _ => None,
+            })
+            .expect("a full listen must report analysis");
+        assert_eq!(reported.0, 7, "the event carries the track id");
+        assert!(reported.1.is_some(), "a click track has a tempo");
+        assert!(engine.analysing.is_none(), "the analysis state is consumed");
+    }
+
+    #[cfg(feature = "analysis")]
+    #[test]
+    fn a_partial_listen_reports_no_analysis() {
+        let (mut engine, sink) = captured_engine();
+        engine.analysing = Some((
+            3,
+            super::super::analysis::Analysis::new(44_100, 2).expect("analysis"),
+        ));
+
+        engine.finish_measuring(false); // a seek or skip, not a full listen
+        assert!(
+            !sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::TrackAnalysis { .. })),
+            "a partial listen must not report analysis"
+        );
+        assert!(engine.analysing.is_none(), "but the state is still dropped");
     }
 
     /// A store that wants everything measured — what arms the measuring path
