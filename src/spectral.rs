@@ -236,6 +236,18 @@ impl Convolver {
 /// One [`Convolver`] per channel over interleaved audio, with a click-free
 /// kernel swap: [`set_kernel`](Self::set_kernel) runs the old and new kernels
 /// in parallel for one block and equal-power crossfades between them.
+///
+/// Sub-block input is staged *here*, so the per-channel convolvers only ever
+/// see whole blocks. That keeps the active and incoming convolvers exactly
+/// frame-aligned through a swap — the crossfade blends sample for sample —
+/// which they would not be if each staged its own ragged remainder.
+///
+/// A rolling `history` of the most recent input (at least one kernel length)
+/// is kept so [`set_kernel`](Self::set_kernel) can *warm* the incoming
+/// convolvers before the crossfade: a linear-phase kernel's energy sits at its
+/// centre, so a cold start would fall silent for its whole group delay and the
+/// crossfade would drop out. Primed with the recent past, the new kernel is
+/// already at steady state when the blend begins.
 pub struct StereoConvolver {
     channels: usize,
     block: usize,
@@ -244,7 +256,15 @@ pub struct StereoConvolver {
     next: Option<Vec<Convolver>>,
     /// Frames into the crossfade, `0..block`.
     fade_pos: usize,
-    /// Deinterleaved input and per-channel outputs, reused every call.
+    /// Interleaved input held until at least a whole block has arrived.
+    stage: Vec<f32>,
+    /// The most recent whole-block input, up to `warmup_frames`, for priming a
+    /// freshly-swapped kernel to steady state.
+    history: Vec<f32>,
+    /// How many recent frames of `history` to keep and prime with — a kernel
+    /// length rounded up to a whole block.
+    warmup_frames: usize,
+    /// Deinterleaved whole-block input and per-channel outputs, reused per call.
     channel_in: Vec<Vec<f32>>,
     out_active: Vec<Vec<f32>>,
     out_next: Vec<Vec<f32>>,
@@ -263,6 +283,9 @@ impl StereoConvolver {
                 .collect(),
             next: None,
             fade_pos: 0,
+            stage: Vec::new(),
+            history: Vec::new(),
+            warmup_frames: kernel.len().div_ceil(block) * block,
             channel_in: (0..channels).map(|_| Vec::new()).collect(),
             out_active: (0..channels).map(|_| Vec::new()).collect(),
             out_next: (0..channels).map(|_| Vec::new()).collect(),
@@ -270,33 +293,52 @@ impl StereoConvolver {
     }
 
     /// Swaps in a new kernel with an equal-power crossfade over the next block,
-    /// so a change mid-stream produces no click. A swap requested while another
-    /// is still fading restarts the crossfade from the active kernel to this
-    /// newest one, discarding the previous incoming kernel.
+    /// so a change mid-stream produces no click. The incoming convolvers are
+    /// primed with recent input first, so they are at steady state — not cold
+    /// and silent through their group delay — when the blend starts. A swap
+    /// requested while another is still fading restarts the crossfade from the
+    /// active kernel to this newest one, discarding the previous incoming one.
     pub fn set_kernel(&mut self, kernel: &[f32]) {
-        self.next = Some(
-            (0..self.channels)
-                .map(|_| Convolver::new(kernel, self.block))
-                .collect(),
-        );
+        let channels = self.channels;
+        let mut next: Vec<Convolver> = (0..channels)
+            .map(|_| Convolver::new(kernel, self.block))
+            .collect();
+        // Prime with the retained history so the new kernel is warm. The
+        // history is whole blocks, so each primed convolver ends on a block
+        // boundary, aligned with the active ones for the crossfade.
+        if !self.history.is_empty() {
+            deinterleave_into(&mut self.channel_in, &self.history, channels);
+            let mut discard = Vec::new();
+            for (convolver, signal) in next.iter_mut().zip(self.channel_in.iter()) {
+                discard.clear();
+                convolver.process(signal, &mut discard);
+            }
+        }
+        self.next = Some(next);
         self.fade_pos = 0;
+        self.warmup_frames = kernel.len().div_ceil(self.block) * self.block;
     }
 
     /// Convolves interleaved `input`, appending interleaved result to `output`.
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         let channels = self.channels;
-        for channel in self.channel_in.iter_mut() {
-            channel.clear();
+        self.stage.extend_from_slice(input);
+        // Feed the convolvers only whole blocks, so active and next stay aligned.
+        let whole = (self.stage.len() / channels / self.block) * self.block;
+        if whole == 0 {
+            return;
         }
-        for frame in input.chunks_exact(channels) {
-            for (channel, sample) in self.channel_in.iter_mut().zip(frame) {
-                channel.push(*sample);
-            }
-        }
+        let whole_samples = whole * channels;
+        deinterleave_into(&mut self.channel_in, &self.stage[..whole_samples], channels);
 
-        for channel in 0..channels {
-            self.out_active[channel].clear();
-            self.active[channel].process(&self.channel_in[channel], &mut self.out_active[channel]);
+        for ((convolver, out), signal) in self
+            .active
+            .iter_mut()
+            .zip(self.out_active.iter_mut())
+            .zip(self.channel_in.iter())
+        {
+            out.clear();
+            convolver.process(signal, out);
         }
         let frames = self.out_active[0].len();
 
@@ -306,46 +348,68 @@ impl StereoConvolver {
                     output.push(self.out_active[channel][i]);
                 }
             }
-            return;
+        } else {
+            // A swap is fading: run the primed incoming convolvers over the same
+            // input, then blend old → new equal-power across `block` frames.
+            {
+                let next = self.next.as_mut().expect("checked is_none above");
+                for ((convolver, signal), out) in next
+                    .iter_mut()
+                    .zip(self.channel_in.iter())
+                    .zip(self.out_next.iter_mut())
+                {
+                    out.clear();
+                    convolver.process(signal, out);
+                }
+            }
+            for i in 0..frames {
+                let t = ((self.fade_pos + i) as f32 / self.block as f32).min(1.0);
+                let (fade_out, fade_in) = equal_power(t);
+                for channel in 0..channels {
+                    output.push(
+                        self.out_active[channel][i] * fade_out
+                            + self.out_next[channel][i] * fade_in,
+                    );
+                }
+            }
+            self.fade_pos += frames;
+            if self.fade_pos >= self.block {
+                self.active = self.next.take().expect("checked is_none above");
+                self.fade_pos = 0;
+            }
         }
 
-        // A swap is fading: run the incoming convolvers over the same input,
-        // then blend old → new equal-power across `block` frames.
-        {
-            let next = self.next.as_mut().expect("checked is_none above");
-            for ((convolver, input), out) in next
-                .iter_mut()
-                .zip(self.channel_in.iter())
-                .zip(self.out_next.iter_mut())
-            {
-                out.clear();
-                convolver.process(input, out);
-            }
+        // Retain the recent past for warming a future kernel swap.
+        self.history.extend_from_slice(&self.stage[..whole_samples]);
+        let cap = self.warmup_frames * channels;
+        if self.history.len() > cap {
+            let excess = self.history.len() - cap;
+            self.history.drain(..excess);
         }
-        for i in 0..frames {
-            let t = ((self.fade_pos + i) as f32 / self.block as f32).min(1.0);
-            let (fade_out, fade_in) = equal_power(t);
-            for channel in 0..channels {
-                output.push(
-                    self.out_active[channel][i] * fade_out + self.out_next[channel][i] * fade_in,
-                );
-            }
-        }
-        self.fade_pos += frames;
-        if self.fade_pos >= self.block {
-            self.active = self.next.take().expect("checked is_none above");
-            self.fade_pos = 0;
-        }
+        self.stage.drain(..whole_samples);
     }
 
-    /// Flushes the active kernel's tail, interleaved. A stream boundary: any
-    /// crossfade still in flight is abandoned — a swap completes within one
-    /// block, so this only bites a `set_kernel` with under a block of audio
-    /// behind it — and the convolvers are a fresh stream afterwards.
+    /// Flushes the staged remainder and the active kernel's tail, interleaved.
+    /// A stream boundary: any crossfade still in flight is abandoned — a swap
+    /// completes within one block, so this only bites a `set_kernel` with under
+    /// a block of audio behind it — and the convolvers are fresh afterwards.
     pub fn drain(&mut self, output: &mut Vec<f32>) {
         let channels = self.channels;
+        // Push the sub-block remainder into the active convolvers, then flush.
+        let remainder = self.stage.len() / channels;
+        if remainder > 0 {
+            deinterleave_into(&mut self.channel_in, &self.stage, channels);
+        }
         let mut per_channel: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
-        for (convolver, out) in self.active.iter_mut().zip(per_channel.iter_mut()) {
+        for ((convolver, out), signal) in self
+            .active
+            .iter_mut()
+            .zip(per_channel.iter_mut())
+            .zip(self.channel_in.iter())
+        {
+            if remainder > 0 {
+                convolver.process(signal, out);
+            }
             convolver.drain(out);
         }
         let frames = per_channel[0].len();
@@ -354,6 +418,8 @@ impl StereoConvolver {
                 output.push(channel[i]);
             }
         }
+        self.stage.clear();
+        self.history.clear();
         self.next = None;
         self.fade_pos = 0;
     }
@@ -363,6 +429,8 @@ impl StereoConvolver {
         for convolver in self.active.iter_mut() {
             convolver.reset();
         }
+        self.stage.clear();
+        self.history.clear();
         self.next = None;
         self.fade_pos = 0;
     }
@@ -370,6 +438,18 @@ impl StereoConvolver {
     /// Latency the convolvers add: none (see [`Convolver::latency_frames`]).
     pub fn latency_frames(&self) -> usize {
         0
+    }
+}
+
+/// Deinterleaves `src` into per-channel buffers, one push per sample.
+fn deinterleave_into(channel_in: &mut [Vec<f32>], src: &[f32], channels: usize) {
+    for channel in channel_in.iter_mut() {
+        channel.clear();
+    }
+    for frame in src.chunks_exact(channels) {
+        for (channel, sample) in channel_in.iter_mut().zip(frame) {
+            channel.push(*sample);
+        }
     }
 }
 
