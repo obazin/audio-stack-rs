@@ -373,26 +373,11 @@ mod tests {
         output
     }
 
-    /// Dominant frequency of a mono view of interleaved stereo, via the same
-    /// realfft the analyser uses.
+    /// Dominant frequency of a mono view of interleaved stereo, via the shared
+    /// spectral assertion helper.
     fn dominant_hz(interleaved: &[f32]) -> f32 {
-        use realfft::RealFftPlanner;
         let mono: Vec<f32> = interleaved.chunks_exact(2).map(|f| f[0]).collect();
-        // A power-of-two window from the middle, past any fade-in.
-        let window = 16_384.min(mono.len() / 2);
-        let start = (mono.len() - window) / 2;
-        let mut buf: Vec<f32> = mono[start..start + window].to_vec();
-        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(window);
-        let mut spectrum = fft.make_output_vec();
-        fft.process(&mut buf, &mut spectrum).unwrap();
-        let bin = spectrum
-            .iter()
-            .enumerate()
-            .skip(1)
-            .max_by(|a, b| a.1.norm().total_cmp(&b.1.norm()))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        bin as f32 * RATE as f32 / window as f32
+        crate::spectral::test_support::dominant_hz(&mono, RATE)
     }
 
     #[test]
