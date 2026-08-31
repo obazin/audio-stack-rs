@@ -34,6 +34,7 @@ mod output;
 mod params;
 mod queue;
 mod resample;
+mod spectral;
 mod stream;
 #[cfg(feature = "stretch")]
 mod stretch;
