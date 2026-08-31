@@ -52,8 +52,13 @@ impl Eq {
         }
         self.epoch = epoch;
 
+        // When the FIR EQ owns the gains it builds flat coefficients here, so
+        // the two EQs never stack. `gains` staying zero yields unity peaking
+        // filters — the callback becomes a transparent pass-through.
         let mut gains = [0.0f32; EQ_BAND_COUNT];
-        params.eq_gains(&mut gains);
+        if !fir_eq_flattens_callback(params) {
+            params.eq_gains(&mut gains);
+        }
 
         for band in 0..EQ_BAND_COUNT {
             let coefficients = peaking(self.sample_rate, CENTER_FREQS[band], gains[band]);
@@ -89,6 +94,18 @@ impl Eq {
             }
         }
     }
+}
+
+/// Whether the FIR EQ has taken over the band gains, so the callback bank runs
+/// flat. Always false without the feature, so `sync` compiles to exactly what
+/// it was and a feature-off build is byte-identical.
+#[cfg(feature = "fir-eq")]
+fn fir_eq_flattens_callback(params: &Params) -> bool {
+    params.fir_eq_active()
+}
+#[cfg(not(feature = "fir-eq"))]
+fn fir_eq_flattens_callback(_params: &Params) -> bool {
+    false
 }
 
 /// Peaking-EQ coefficients, falling back to a pass-through if the parameters

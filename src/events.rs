@@ -88,6 +88,12 @@ pub enum EngineEvent {
     #[cfg(feature = "stretch")]
     #[serde(rename_all = "camelCase")]
     TimeStretch { enabled: bool, ratio: f32 },
+    /// The linear-phase FIR EQ setting, echoed on every change and on subscribe
+    /// so a reloaded UI recovers it. `latency_secs` is the constant delay the
+    /// effect adds while enabled (0 when off), which a UI can surface.
+    #[cfg(feature = "fir-eq")]
+    #[serde(rename_all = "camelCase")]
+    FirEq { enabled: bool, latency_secs: f32 },
     /// Playback failed. Non-fatal: the engine stays alive and idle.
     #[serde(rename_all = "camelCase")]
     Error { message: String },
@@ -141,6 +147,18 @@ mod tests {
         assert!(encoded.contains(r#""event":"timeStretch""#), "{encoded}");
         assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
         assert!(encoded.contains(r#""ratio":1.5"#), "{encoded}");
+    }
+
+    #[cfg(feature = "fir-eq")]
+    #[test]
+    fn fir_eq_event_is_tagged_and_camel_cased() {
+        let encoded = json(&EngineEvent::FirEq {
+            enabled: true,
+            latency_secs: 0.0427,
+        });
+        assert!(encoded.contains(r#""event":"firEq""#), "{encoded}");
+        assert!(encoded.contains(r#""enabled":true"#), "{encoded}");
+        assert!(encoded.contains(r#""latencySecs":0.0427"#), "{encoded}");
     }
 
     #[test]

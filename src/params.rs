@@ -50,6 +50,12 @@ pub struct Params {
     /// source of truth for playback position, so what the UI shows is what
     /// the listener hears rather than what the decoder has run ahead to.
     frames_played: AtomicU64,
+    /// Set while the linear-phase FIR EQ owns the ten band gains: the callback
+    /// biquad EQ then builds flat coefficients so the two do not stack. Read
+    /// under the same `eq_epoch` acquire as the gains — [`Self::set_fir_eq_active`]
+    /// bumps the epoch so the callback rebuilds the moment the flag flips.
+    #[cfg(feature = "fir-eq")]
+    fir_eq_active: AtomicBool,
 }
 
 impl Default for Params {
@@ -61,6 +67,8 @@ impl Default for Params {
             track_gain: AtomicU32::new(1.0f32.to_bits()),
             flush: AtomicBool::new(false),
             frames_played: AtomicU64::new(0),
+            #[cfg(feature = "fir-eq")]
+            fir_eq_active: AtomicBool::new(false),
         }
     }
 }
@@ -90,6 +98,24 @@ impl Params {
             slot.store(clamped.to_bits(), Ordering::Relaxed);
         }
         // The epoch is the publish flag for the ten stores above.
+        self.eq_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether the FIR EQ has taken over the band gains, so the callback EQ
+    /// should run flat. Read with `Relaxed`; the `Acquire` on `eq_epoch` in
+    /// [`Self::eq_epoch`] is what orders this against the epoch bump that
+    /// publishes it.
+    #[cfg(feature = "fir-eq")]
+    pub fn fir_eq_active(&self) -> bool {
+        self.fir_eq_active.load(Ordering::Relaxed)
+    }
+
+    /// Hands the band gains to (or back from) the FIR EQ. Bumps `eq_epoch` with
+    /// `Release` so a callback that observes the new epoch also observes the
+    /// flag — the same publish pattern [`Self::set_eq_gains`] uses for the gains.
+    #[cfg(feature = "fir-eq")]
+    pub fn set_fir_eq_active(&self, active: bool) {
+        self.fir_eq_active.store(active, Ordering::Relaxed);
         self.eq_epoch.fetch_add(1, Ordering::Release);
     }
 
@@ -185,6 +211,20 @@ mod tests {
         );
         params.finish_flush();
         assert!(!params.flush_pending(), "the engine may pump again");
+    }
+
+    #[cfg(feature = "fir-eq")]
+    #[test]
+    fn taking_the_eq_for_the_fir_bumps_the_epoch_so_the_callback_rebuilds() {
+        let params = Params::default();
+        assert!(!params.fir_eq_active());
+        let before = params.eq_epoch();
+        params.set_fir_eq_active(true);
+        assert!(params.fir_eq_active());
+        assert!(
+            params.eq_epoch() > before,
+            "flipping the flag must publish via the epoch, so the callback flattens"
+        );
     }
 
     #[test]

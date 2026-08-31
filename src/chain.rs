@@ -486,6 +486,53 @@ impl Chain {
             .map(|e| e.setting())
             .unwrap_or((false, 1.0))
     }
+
+    /// Enables/disables the linear-phase FIR EQ, creating or retiring the
+    /// effect as needed. It reads its band gains from `params`, the same block
+    /// the callback EQ reads. Mirrors [`Chain::set_time_stretch`].
+    #[cfg(feature = "fir-eq")]
+    pub fn set_fir_eq(
+        &mut self,
+        enabled: bool,
+        params: &std::sync::Arc<super::params::Params>,
+    ) -> Result<(), String> {
+        use super::fireq::FirEq;
+        let existing = self
+            .effects
+            .iter_mut()
+            .find_map(|e| e.as_any_mut().downcast_mut::<FirEq>());
+        match existing {
+            Some(effect) => {
+                effect.set(enabled);
+                if enabled && effect.is_bypassed() && self.rate > 0 && self.channels > 0 {
+                    effect.reconfigure(self.rate, self.channels)?;
+                }
+            }
+            None if enabled => {
+                let mut effect = FirEq::new(std::sync::Arc::clone(params));
+                effect.set(true);
+                if self.rate > 0 && self.channels > 0 {
+                    effect.reconfigure(self.rate, self.channels)?;
+                }
+                self.effects.push(Box::new(effect));
+            }
+            None => {}
+        }
+        self.effects.retain(|e| e.is_active());
+        Ok(())
+    }
+
+    /// The current FIR EQ setting and its latency at `rate`, for the event echo
+    /// and `describe`.
+    #[cfg(feature = "fir-eq")]
+    pub fn fir_eq(&mut self, rate: u32) -> (bool, f32) {
+        use super::fireq::FirEq;
+        self.effects
+            .iter_mut()
+            .find_map(|e| e.as_any_mut().downcast_mut::<FirEq>())
+            .map(|e| (e.enabled(), e.latency_secs(rate)))
+            .unwrap_or((false, 0.0))
+    }
 }
 
 #[cfg(test)]

@@ -94,6 +94,13 @@ pub enum EngineCommand {
         enabled: bool,
         ratio: f32,
     },
+    /// Enables/disables the linear-phase FIR EQ. It applies the same ten band
+    /// gains as the callback EQ but with linear phase and ~43 ms latency; while
+    /// it is on the callback EQ runs flat so the two do not stack.
+    #[cfg(feature = "fir-eq")]
+    SetFirEq {
+        enabled: bool,
+    },
     /// A now-playing poller reporting what a station is playing. Carries the
     /// epoch it started under so a late answer about a station the listener
     /// has already left is discarded.
@@ -475,6 +482,27 @@ impl Engine {
                 let (enabled, ratio) = self.chain.time_stretch();
                 self.emit(EngineEvent::TimeStretch { enabled, ratio });
             }
+            #[cfg(feature = "fir-eq")]
+            EngineCommand::SetFirEq { enabled } => {
+                // Flatten (or restore) the callback EQ first, so the two never
+                // stack: the FIR effect then owns the band gains while on.
+                self.params.set_fir_eq_active(enabled);
+                if let Err(message) = self.chain.set_fir_eq(enabled, &self.params) {
+                    self.emit(EngineEvent::Error { message });
+                }
+                // A crossfade's incoming track mirrors the setting, or it would
+                // be adopted with the effect in the wrong state.
+                if let Some(transition) = self.transition.as_mut() {
+                    if let Err(message) = transition.chain.set_fir_eq(enabled, &self.params) {
+                        self.emit(EngineEvent::Error { message });
+                    }
+                }
+                let (enabled, latency_secs) = self.chain.fir_eq(self.device_rate());
+                self.emit(EngineEvent::FirEq {
+                    enabled,
+                    latency_secs,
+                });
+            }
             EngineCommand::SetDevice(id) => {
                 self.device_id = id;
                 // Rebuilding the stream is the only way to change device, and
@@ -693,6 +721,14 @@ impl Engine {
         {
             let (enabled, ratio) = self.chain.time_stretch();
             self.emit(EngineEvent::TimeStretch { enabled, ratio });
+        }
+        #[cfg(feature = "fir-eq")]
+        {
+            let (enabled, latency_secs) = self.chain.fir_eq(self.device_rate());
+            self.emit(EngineEvent::FirEq {
+                enabled,
+                latency_secs,
+            });
         }
         // Before `State`, whose index refers into this queue. The `State`
         // event alone cannot rebuild a reloaded webview's track list.
@@ -1708,10 +1744,10 @@ mod tests {
     }
 
     /// Collects emitted events, for the tests that assert on the echo.
-    #[cfg(feature = "stretch")]
+    #[cfg(any(feature = "stretch", feature = "fir-eq"))]
     struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
 
-    #[cfg(feature = "stretch")]
+    #[cfg(any(feature = "stretch", feature = "fir-eq"))]
     impl crate::EventSink for CaptureSink {
         fn send_event(&self, event: EngineEvent) {
             self.0.lock().unwrap().push(event);
@@ -1719,7 +1755,7 @@ mod tests {
         fn send_frame(&self, _frame: &[u8]) {}
     }
 
-    #[cfg(feature = "stretch")]
+    #[cfg(any(feature = "stretch", feature = "fir-eq"))]
     fn captured_engine() -> (Engine, Arc<CaptureSink>) {
         let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1789,6 +1825,57 @@ mod tests {
                     ratio,
                 } if (*ratio - 1.25).abs() < 1e-6
             )),
+            "a reloaded UI must recover the setting from describe()"
+        );
+    }
+
+    #[cfg(feature = "fir-eq")]
+    #[test]
+    fn set_fir_eq_echoes_and_flattens_the_callback_eq() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetFirEq { enabled: true });
+
+        let events = sink.0.lock().unwrap();
+        let enabled = events
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::FirEq { enabled, .. } => Some(*enabled),
+                _ => None,
+            })
+            .expect("the setting must be echoed");
+        assert!(enabled, "enabling must be echoed as enabled");
+        assert!(
+            engine.params.fir_eq_active(),
+            "the callback EQ must be flattened while the FIR EQ owns the gains"
+        );
+    }
+
+    #[cfg(feature = "fir-eq")]
+    #[test]
+    fn disabling_fir_eq_restores_the_callback_eq() {
+        let (mut engine, _sink) = captured_engine();
+        engine.handle(EngineCommand::SetFirEq { enabled: true });
+        assert!(engine.params.fir_eq_active());
+        engine.handle(EngineCommand::SetFirEq { enabled: false });
+        assert!(
+            !engine.params.fir_eq_active(),
+            "disabling must hand the gains back to the callback EQ"
+        );
+    }
+
+    #[cfg(feature = "fir-eq")]
+    #[test]
+    fn describe_recovers_the_fir_eq_setting() {
+        let (mut engine, sink) = captured_engine();
+        engine.handle(EngineCommand::SetFirEq { enabled: true });
+        sink.0.lock().unwrap().clear();
+
+        engine.describe();
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::FirEq { enabled: true, .. })),
             "a reloaded UI must recover the setting from describe()"
         );
     }

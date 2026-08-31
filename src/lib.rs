@@ -25,6 +25,8 @@ mod decode;
 mod dsp;
 mod engine;
 mod events;
+#[cfg(feature = "fir-eq")]
+mod fireq;
 mod loudness;
 mod metadata;
 mod nowplaying;
@@ -193,6 +195,18 @@ impl AudioEngine {
     #[cfg(feature = "stretch")]
     pub fn set_time_stretch(&self, enabled: bool, ratio: f32) {
         let _ = self.send(EngineCommand::SetTimeStretch { enabled, ratio });
+    }
+
+    /// Enables/disables the linear-phase FIR EQ. It applies the same ten band
+    /// gains as [`set_eq`](Self::set_eq) but with no inter-band phase
+    /// distortion, taking over from the realtime biquad EQ while on. The cost
+    /// is a constant ~43 ms latency (at 48 kHz): heard audio sits that far
+    /// behind the reported position while enabled, and a change — enabling,
+    /// disabling, or a slider move — is heard once the ~0.5 s already buffered
+    /// has played. Echoed as [`EngineEvent::FirEq`] with the exact latency.
+    #[cfg(feature = "fir-eq")]
+    pub fn set_fir_eq(&self, enabled: bool) {
+        let _ = self.send(EngineCommand::SetFirEq { enabled });
     }
 
     /// Re-emit everything the host needs to render current state. Call after a

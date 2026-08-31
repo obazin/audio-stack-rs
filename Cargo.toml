@@ -22,6 +22,14 @@ opus = ["dep:opus", "dep:symphonia-common"]
 # because it pulls in the pre-1.0 `timestretch` engine (pinned exactly); pure
 # Rust, so it does not bring back the C toolchain the `opus` split removed.
 stretch = ["dep:timestretch"]
+# Linear-phase FIR EQ: a mastering-style ten-band EQ in the decode-thread
+# effect chain, with no inter-band phase distortion, toggled via
+# `AudioEngine::set_fir_eq`. It complements — does not replace — the realtime
+# biquad EQ: the callback EQ stays the zero-latency default, this is the opt-in
+# high-quality mode (≈43 ms latency at 48 kHz). Pure code, no new dependency
+# (it reuses the `realfft` the analyser already links), so feature-off builds
+# are byte-identical.
+fir-eq = []
 
 # Audible time-stretch walkthrough: synthesizes a copyright-free clip and
 # steps the tempo live. `cargo run --example time_stretch --features stretch`.
