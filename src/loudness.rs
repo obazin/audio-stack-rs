@@ -47,6 +47,11 @@ pub fn parse_gain_db(raw: &str) -> Option<f64> {
 
 /// Parses a ReplayGain peak — a linear amplitude where 1.0 is full scale, not
 /// a dB value. Can legitimately exceed 1.0 on a clipped master.
+///
+/// Note this is a *sample* peak: taggers write the largest sample value, which
+/// under-reads the reconstructed inter-sample peak by up to ~3 dB. The peak
+/// this crate *measures* ([`Measured::peak`]) is BS.1770-4 true peak instead,
+/// so the two are not directly comparable — treat a tag peak as a floor.
 pub fn parse_peak(raw: &str) -> Option<f64> {
     let value: f64 = raw.trim().replace(',', ".").parse().ok()?;
     (value.is_finite() && value >= 0.0).then_some(value)
@@ -114,7 +119,9 @@ impl Store for NoStore {
 pub struct Measured {
     /// Integrated loudness in LUFS.
     pub lufs: f64,
-    /// True peak, linear.
+    /// True peak (BS.1770-4, inter-sample), linear: 1.0 is full scale and it
+    /// can exceed 1.0. Unlike a ReplayGain tag peak (see [`parse_peak`]), which
+    /// is sample peak, this catches inter-sample overshoot a sample read misses.
     pub peak: f64,
 }
 
@@ -159,7 +166,10 @@ impl Loudness {
     /// The result, or `None` when there was not enough audio to judge.
     ///
     /// EBU R128 gates on 400 ms blocks, so anything shorter — and anything
-    /// silent — reports `-inf` rather than an error.
+    /// silent — reports `-inf` rather than an error. The peak is BS.1770-4 true
+    /// peak: `ebur128`'s `TRUE_PEAK` mode oversamples 4× (2× above 96 kHz) with
+    /// a polyphase FIR, so an inter-sample crest a bare sample-peak read would
+    /// miss is caught here — the max across channels.
     pub fn finish(&self) -> Option<Measured> {
         let lufs = self.meter.loudness_global().ok()?;
         if !lufs.is_finite() {
@@ -294,6 +304,41 @@ mod tests {
             measured.lufs
         );
         assert!(measured.peak > 0.9, "peak was {}", measured.peak);
+    }
+
+    #[test]
+    fn true_peak_catches_an_inter_sample_peak_the_samples_miss() {
+        // A full-scale sine at Fs/4, phased (π/4) so every sample lands on a
+        // ±1/√2 shoulder: the samples never exceed ~0.707 (−3 dBFS), yet the
+        // band-limited waveform between them reaches full scale. BS.1770-4 true
+        // peak oversamples and recovers that crest; a naive sample-peak read
+        // would miss it, and a normalization gain trusting the samples would
+        // then clip the DAC by ~3 dB. This is exactly the case `Measured.peak`
+        // exists to catch — proven here to already be caught.
+        let rate = 48_000u32;
+        let signal: Vec<f32> = (0..rate * 2)
+            .map(|n| {
+                let phase =
+                    std::f32::consts::FRAC_PI_4 + (n % 4) as f32 * std::f32::consts::FRAC_PI_2;
+                phase.sin()
+            })
+            .collect();
+
+        let sample_peak = signal.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            sample_peak < 0.72,
+            "the samples themselves stay near -3 dBFS: {sample_peak}"
+        );
+
+        let mut meter = Loudness::new(rate, 1).expect("meter");
+        meter.feed(&signal);
+        let measured = meter.finish().expect("two seconds is enough to gate");
+        assert!(
+            measured.peak > 1.0,
+            "true peak must read above full scale (> 0 dBTP), while the sample \
+             peak sits near -3 dBFS: true {}, sample {sample_peak}",
+            measured.peak
+        );
     }
 
     #[test]
