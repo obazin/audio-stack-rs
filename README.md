@@ -130,7 +130,7 @@ let meta  = audio_stack_rs::read_metadata(std::path::Path::new("/music/track.fla
 let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>, base64 data URL parts
 ```
 
-`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
+`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `seek_by`, `set_loop`/`clear_loop`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
 
 ## Architecture notes
 

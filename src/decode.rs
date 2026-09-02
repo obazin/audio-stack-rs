@@ -36,7 +36,8 @@ pub struct Decoder {
     /// rarely lines up with a device buffer, so the remainder waits here.
     pending: Vec<f32>,
     pending_read: usize,
-    position_secs: f64,
+    /// Source seconds of the packet currently buffered in `pending`.
+    packet_secs: f64,
     exhausted: bool,
 }
 
@@ -125,7 +126,7 @@ impl Decoder {
             },
             pending: Vec::new(),
             pending_read: 0,
-            position_secs: 0.0,
+            packet_secs: 0.0,
             exhausted: false,
         })
     }
@@ -136,6 +137,14 @@ impl Decoder {
 
     pub fn is_exhausted(&self) -> bool {
         self.exhausted
+    }
+
+    /// Source seconds of the next sample `read` will return: the buffered
+    /// packet's timestamp plus however much of it has already been handed
+    /// out. Sample-accurate, unlike the packet timestamp alone.
+    pub fn position_secs(&self) -> f64 {
+        let frame = (self.format.sample_rate as f64) * (self.format.channels.max(1) as f64);
+        self.packet_secs + self.pending_read as f64 / frame.max(1.0)
     }
 
     /// Fills `out` with interleaved samples at the source's own rate and
@@ -181,7 +190,7 @@ impl Decoder {
 
             if let Some(base) = self.time_base {
                 if let Some(time) = base.calc_time(packet.pts) {
-                    self.position_secs = time.as_secs_f64();
+                    self.packet_secs = time.as_secs_f64();
                 }
             }
 
@@ -209,6 +218,11 @@ impl Decoder {
     }
 
     /// Seeks to `secs`, returning the position actually reached.
+    ///
+    /// Sample-accurate: symphonia's accurate seek lands on the packet at or
+    /// before the target and leaves the rest to the caller, so the samples
+    /// between that packet's start and the target are decoded and dropped
+    /// here. Only a target past the end lands short.
     pub fn seek(&mut self, secs: f64) -> Result<f64, String> {
         let time = Time::try_from_secs_f64(secs.max(0.0))
             .ok_or_else(|| format!("seek target out of range: {}", secs))?;
@@ -231,13 +245,36 @@ impl Decoder {
         self.pending_read = 0;
         self.exhausted = false;
 
-        self.position_secs = self
+        let actual = self
             .time_base
             .and_then(|base| base.calc_time(seeked.actual_ts))
-            .map(|t| t.as_secs_f64())
-            .unwrap_or(secs);
+            .map(|t| t.as_secs_f64());
+        self.packet_secs = actual.unwrap_or(secs);
 
-        Ok(self.position_secs)
+        // Trim from the packet start up to the requested frame. The target is
+        // rounded to a frame here rather than taken from symphonia's
+        // `required_ts`, which floors the seconds-to-timestamp conversion and
+        // so lands a frame early on any target a float hair under a whole
+        // frame. Measured after the first packet decodes, at the rate the
+        // samples actually have.
+        if let Some(actual) = actual {
+            if self.decode_next_packet()? {
+                let rate = self.format.sample_rate as f64;
+                let skip = ((secs * rate).round() - (actual * rate).round()).max(0.0);
+                let mut remaining = skip as usize * self.format.channels.max(1) as usize;
+                let mut scratch = vec![0.0f32; 4096];
+                while remaining > 0 {
+                    let take = remaining.min(scratch.len());
+                    let read = self.read(&mut scratch[..take])?;
+                    if read == 0 {
+                        break;
+                    }
+                    remaining -= read;
+                }
+            }
+        }
+
+        Ok(self.position_secs())
     }
 }
 
@@ -305,7 +342,33 @@ mod tests {
         let mut decoder = decoder_over(wav_bytes(44_100, 2, &ramp(2, 44_100)));
         let landed = decoder.seek(0.5).expect("wav is seekable");
         assert!((landed - 0.5).abs() < 0.01, "landed at {landed}");
-        assert!((decoder.position_secs - landed).abs() < f64::EPSILON);
+        assert!((decoder.position_secs() - landed).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn seeking_is_sample_accurate() {
+        let frames = 44_100;
+        let mut decoder = decoder_over(wav_bytes(44_100, 2, &ramp(2, frames)));
+        // Off any packet boundary: the trim after the packet seek is what
+        // makes this exact.
+        let target = 12_345.0 / 44_100.0;
+        let landed = decoder.seek(target).expect("wav is seekable");
+        assert!(
+            (landed - target).abs() < 0.5 / 44_100.0,
+            "landed {landed} for target {target}: not trimmed to the sample"
+        );
+        let mut buffer = [0.0f32; 2];
+        decoder.read(&mut buffer).unwrap();
+        let expected = ((12_345.0 / frames as f32) * 30_000.0) as i16 as f32 / 32_768.0;
+        assert!(
+            (buffer[0] - expected).abs() < 1e-4,
+            "first sample {} is not source frame 12345 ({expected})",
+            buffer[0]
+        );
+        assert!(
+            (decoder.position_secs() - (target + 1.0 / 44_100.0)).abs() < 0.5 / 44_100.0,
+            "position tracks the trimmed landing plus the one frame read"
+        );
     }
 
     #[test]

@@ -62,7 +62,7 @@ use engine::{Engine, EngineCommand};
 // ── Facade surface (re-exports) ──────────────────────────────────────────────
 
 pub use analyser::FRAME_BYTES;
-pub use events::{EngineEvent, Mode};
+pub use events::{EngineEvent, Mode, SeekDirection};
 pub use loudness::{db_to_linear, gain_db, parse_gain_db, parse_peak, Measured, Store};
 pub use metadata::{
     audio_extension, read_cover, read_metadata, CoverArt, Metadata, AUDIO_EXTENSIONS,
@@ -183,6 +183,42 @@ impl AudioEngine {
     /// Seeks the current track to `position_secs`.
     pub fn seek(&self, position_secs: f64) {
         let _ = self.send(EngineCommand::Seek(position_secs));
+    }
+    /// Seeks the current track `secs` seconds forward or backward from the
+    /// playhead — the position the listener is actually hearing, as reported
+    /// by [`EngineEvent::Position`]. The target is clamped to the track: a
+    /// backward seek never goes before the start, a forward one never past
+    /// the end. A non-finite, zero or negative `secs` is ignored. Like
+    /// [`seek`](Self::seek) it acts only on local playback (a station cannot
+    /// be seeked) and cancels a crossfade in progress.
+    pub fn seek_by(&self, secs: f64, direction: SeekDirection) {
+        let _ = self.send(EngineCommand::SeekBy { secs, direction });
+    }
+    /// Loops the current track between `start_secs` and `end_secs`. Playback
+    /// jumps to `start_secs` now and, each time it reaches `end_secs`, returns
+    /// to `start_secs` — `repeats` more times with `Some(repeats)`, or until
+    /// [`clear_loop`](Self::clear_loop) with `None`. `Some(2)` therefore plays
+    /// the section three times in all before playback continues past the
+    /// end; `Some(0)` plays it once from the start. The jump is gapless and
+    /// sample-accurate. An `end_secs` past the end of the track means the end
+    /// of the track. A seek that lands outside the region plays on past the
+    /// end untouched; one that lands inside it loops again from there. The
+    /// loop belongs to the track: a track change, `stop`, or
+    /// a station clears it, and a crossfade into the next track never starts
+    /// while one is active. A region that is not finite, starts before 0, or
+    /// ends at or before its start is rejected with [`EngineEvent::Error`].
+    /// Local playback only. Echoed as [`EngineEvent::Loop`] on every change.
+    pub fn set_loop(&self, start_secs: f64, end_secs: f64, repeats: Option<u32>) {
+        let _ = self.send(EngineCommand::SetLoop {
+            start_secs,
+            end_secs,
+            repeats,
+        });
+    }
+    /// Removes the loop set by [`set_loop`](Self::set_loop); playback carries
+    /// on from where it is. Echoed as [`EngineEvent::Loop`].
+    pub fn clear_loop(&self) {
+        let _ = self.send(EngineCommand::ClearLoop);
     }
     /// Enables/disables shuffled queue order.
     pub fn set_shuffle(&self, enabled: bool) {

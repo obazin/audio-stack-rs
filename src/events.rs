@@ -7,7 +7,18 @@
 //! channel as raw bytes — see [`super::analyser::FRAME_BYTES`] — because at
 //! 60 Hz the JSON of 170 numbers would cost far more than the 170 bytes do.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Which way a relative seek moves the playhead. See
+/// [`AudioEngine::seek_by`](crate::AudioEngine::seek_by).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SeekDirection {
+    /// Later in the track.
+    Forward,
+    /// Earlier in the track.
+    Backward,
+}
 
 /// What the engine is playing, if anything.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +118,21 @@ pub enum EngineEvent {
         sample_rate: u32,
         /// The device's active channel count.
         channels: u16,
+    },
+    /// The A–B loop, echoed on every change — set, cleared, each pass
+    /// completed — and on subscribe so a reloaded UI recovers it. Cleared
+    /// (with `enabled: false`) whenever the track changes.
+    #[serde(rename_all = "camelCase")]
+    Loop {
+        /// Whether a loop region is active.
+        enabled: bool,
+        /// Start of the region, in seconds; 0 when disabled.
+        start_secs: f64,
+        /// End of the region, in seconds; 0 when disabled.
+        end_secs: f64,
+        /// Passes still to be repeated once the current one reaches
+        /// `end_secs`; `None` means the loop repeats until cleared.
+        repeats_left: Option<u32>,
     },
     /// The time-stretch setting, echoed on every change and on subscribe so
     /// a reloaded UI recovers it. `ratio` 1.0 is normal speed; pitch is

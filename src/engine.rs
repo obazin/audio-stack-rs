@@ -17,7 +17,7 @@ use super::analyser::{Analyser, FRAME_BYTES};
 use super::chain::Chain;
 use super::decode::Decoder;
 use super::dsp::remap_channels;
-use super::events::{EngineEvent, Mode};
+use super::events::{EngineEvent, Mode, SeekDirection};
 use super::icy;
 use super::loudness::{self, Loudness, Store};
 use super::nowplaying::Update;
@@ -76,6 +76,20 @@ pub enum EngineCommand {
     Previous,
     JumpTo(usize),
     Seek(f64),
+    /// A seek relative to the playhead: `secs` (a magnitude) in `direction`,
+    /// clamped to the track.
+    SeekBy {
+        secs: f64,
+        direction: SeekDirection,
+    },
+    /// Loops `[start_secs, end_secs)`, jumping to the start now and back to
+    /// it `repeats` more times on reaching the end (`None`: until cleared).
+    SetLoop {
+        start_secs: f64,
+        end_secs: f64,
+        repeats: Option<u32>,
+    },
+    ClearLoop,
     SetShuffle(bool),
     SetRepeat(bool),
     SetNormalize(bool),
@@ -152,11 +166,26 @@ struct Boundary {
     frame: u64,
     index: usize,
     duration_secs: f64,
+    /// Source seconds the track is at when this boundary reaches the device.
+    /// 0 for the start of a track; the loop start for an A–B loop's jump
+    /// back, whose audio resumes mid-track without a counter rebase.
+    offset_secs: f64,
     /// The gain this track wants, in dB. Applied when the boundary reaches
     /// the device rather than when the decoder crossed it — at a gapless
     /// join the two are up to a ring-buffer apart, and applying it early
     /// would play the tail of the outgoing track at the next track's volume.
     gain_db: f64,
+}
+
+/// An A–B loop on the current track. Detected at the decoder, not at the
+/// device: the read that would cross `end_secs` is capped at it and the
+/// decoder seeks back to `start_secs`, so the jump lands on the exact sample
+/// and joins in-ring like a gapless track boundary — nothing is flushed.
+struct LoopRegion {
+    start_secs: f64,
+    end_secs: f64,
+    /// Jumps back still to make; `None` repeats until cleared.
+    remaining: Option<u32>,
 }
 
 /// A crossfade in progress: the next track decoding and mixing into the
@@ -188,6 +217,30 @@ struct Transition {
     mapped_buf: Vec<f32>,
     /// Resampled, not yet mixed into the ring.
     pending_in: Vec<f32>,
+}
+
+/// Where a seek of `secs` in `direction` from `position` lands, clamped to
+/// `[0, duration]` (`duration` is only an upper bound when known, i.e. > 0).
+/// `None` when there is nothing to do: a non-finite, zero or negative amount.
+fn relative_seek_target(
+    position: f64,
+    secs: f64,
+    direction: SeekDirection,
+    duration: f64,
+) -> Option<f64> {
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    let target = match direction {
+        SeekDirection::Forward => position + secs,
+        SeekDirection::Backward => position - secs,
+    };
+    let target = target.max(0.0);
+    Some(if duration > 0.0 {
+        target.min(duration)
+    } else {
+        target
+    })
 }
 
 pub struct Engine {
@@ -235,6 +288,8 @@ pub struct Engine {
     normalize: bool,
     /// The gain of the track currently being decoded, in dB.
     current_gain_db: f64,
+    /// The A–B loop on the current track, if one is set.
+    loop_region: Option<LoopRegion>,
     /// Loudness being measured for the playing track, when it has no gain of
     /// its own. Abandoned on a seek — a partial listen measures the wrong
     /// thing.
@@ -318,6 +373,7 @@ impl Engine {
             reported_title: None,
             normalize: true,
             current_gain_db: 0.0,
+            loop_region: None,
             measuring: None,
             #[cfg(feature = "analysis")]
             analysing: None,
@@ -454,7 +510,16 @@ impl Engine {
                     self.start_current();
                 }
             }
-            EngineCommand::Seek(secs) => self.seek(secs),
+            EngineCommand::Seek(secs) => {
+                self.seek(secs);
+            }
+            EngineCommand::SeekBy { secs, direction } => self.seek_by(secs, direction),
+            EngineCommand::SetLoop {
+                start_secs,
+                end_secs,
+                repeats,
+            } => self.set_loop(start_secs, end_secs, repeats),
+            EngineCommand::ClearLoop => self.clear_loop(),
             EngineCommand::SetShuffle(enabled) => {
                 self.queue.set_shuffle(enabled);
                 self.refresh_preload();
@@ -805,6 +870,7 @@ impl Engine {
                 codec: format.codec,
             });
         }
+        self.emit_loop();
         #[cfg(feature = "stretch")]
         {
             let (enabled, ratio) = self.chain.time_stretch();
@@ -885,6 +951,7 @@ impl Engine {
         self.pending_out.clear();
         self.chain.reset();
         self.boundaries.clear();
+        self.clear_loop();
         self.fade_then_pause();
         self.emit_state();
     }
@@ -910,16 +977,17 @@ impl Engine {
         }
     }
 
-    fn seek(&mut self, secs: f64) {
+    /// Returns whether the seek landed (an error has been emitted otherwise).
+    fn seek(&mut self, secs: f64) -> bool {
         if self.mode != Mode::Local {
-            return;
+            return false;
         }
         // A seek acts on the track the listener is looking at — the
         // outgoing one, if a crossfade happens to be running — so any fade
         // in progress is cancelled first (restoring the cursor to it).
         self.cancel_transition();
         let Some(decoder) = self.decoder.as_mut() else {
-            return;
+            return false;
         };
         // Whatever has been measured so far no longer describes a full
         // listen.
@@ -949,11 +1017,164 @@ impl Engine {
                     index: self.queue.index(),
                     duration_secs: self.current_duration,
                     gain_db: self.current_gain_db,
+                    offset_secs: 0.0,
                 });
                 self.emit_progress_now();
+                true
             }
-            Err(message) => self.emit(EngineEvent::Error { message }),
+            Err(message) => {
+                self.emit(EngineEvent::Error { message });
+                false
+            }
         }
+    }
+
+    /// Seeks `secs` forward or backward from the playhead. The playhead is
+    /// what the listener hears, not where the decoder has run ahead to, so
+    /// "ten seconds back" lands ten seconds before the audio coming out of
+    /// the speakers. During a crossfade `position_secs` still describes the
+    /// outgoing track (no boundary is pushed until the fade completes),
+    /// which is the track `seek` acts on once it cancels the fade — so the
+    /// origin and the target agree.
+    fn seek_by(&mut self, secs: f64, direction: SeekDirection) {
+        if self.mode != Mode::Local || self.decoder.is_none() {
+            return;
+        }
+        let Some(target) =
+            relative_seek_target(self.position_secs(), secs, direction, self.current_duration)
+        else {
+            return;
+        };
+        self.seek(target);
+    }
+
+    // ── A–B loop ────────────────────────────────────────────────────────
+
+    fn set_loop(&mut self, start_secs: f64, end_secs: f64, repeats: Option<u32>) {
+        if self.mode != Mode::Local || self.decoder.is_none() {
+            return;
+        }
+        let valid = start_secs.is_finite()
+            && end_secs.is_finite()
+            && start_secs >= 0.0
+            && end_secs > start_secs;
+        if !valid {
+            self.emit(EngineEvent::Error {
+                message: format!("loop: invalid region {start_secs}s to {end_secs}s"),
+            });
+            return;
+        }
+        self.loop_region = Some(LoopRegion {
+            start_secs,
+            end_secs,
+            remaining: repeats,
+        });
+        // The first pass starts from the top, however far in the playhead
+        // was. A start the track cannot reach leaves nothing to loop.
+        if !self.seek(start_secs) {
+            self.loop_region = None;
+            return;
+        }
+        self.emit_loop();
+    }
+
+    fn clear_loop(&mut self) {
+        if self.loop_region.take().is_some() {
+            self.emit_loop();
+        }
+    }
+
+    fn emit_loop(&mut self) {
+        let (enabled, start_secs, end_secs, repeats_left) = match self.loop_region.as_ref() {
+            Some(region) => (true, region.start_secs, region.end_secs, region.remaining),
+            None => (false, 0.0, 0.0, None),
+        };
+        self.emit(EngineEvent::Loop {
+            enabled,
+            start_secs,
+            end_secs,
+            repeats_left,
+        });
+    }
+
+    /// How many source frames the next decoder read may take before it
+    /// crosses the loop end — `None` when no loop applies to where the
+    /// decoder is. "Applies" means the decoder sits inside the region: a
+    /// seek that lands outside it plays on past the end untouched, rather
+    /// than snapping back the moment it is noticed.
+    fn loop_read_frames(&self) -> Option<usize> {
+        let region = self.loop_region.as_ref()?;
+        let decoder = self.decoder.as_ref()?;
+        let position = decoder.position_secs();
+        let rate = decoder.format().sample_rate.max(1) as f64;
+        // Half a frame of slack on both edges: the landing position is a
+        // sum of packet time and sample offset, and an ulp short of the
+        // start must still count as being at it.
+        let half_frame = 0.5 / rate;
+        if position + half_frame < region.start_secs || position + half_frame >= region.end_secs {
+            return None;
+        }
+        // Rounded, not ceiled: a float hair over a whole frame must not read
+        // one frame too many, and an end between two frames may land on
+        // either.
+        Some((((region.end_secs - position) * rate).round() as usize).max(1))
+    }
+
+    /// Whether a decoder that was inside the region has now reached its end
+    /// — or the end of the track, for a region that runs past it.
+    fn loop_end_reached(&self) -> bool {
+        let (Some(region), Some(decoder)) = (self.loop_region.as_ref(), self.decoder.as_ref())
+        else {
+            return false;
+        };
+        let half_frame = 0.5 / decoder.format().sample_rate.max(1) as f64;
+        decoder.is_exhausted() || decoder.position_secs() + half_frame >= region.end_secs
+    }
+
+    /// The jump back to the loop start, at the decoder. No flush: the audio
+    /// already decoded up to the loop end is still to be heard, so the
+    /// looped audio joins it in the ring exactly as a gapless track boundary
+    /// does, and a boundary marks where the playhead reads `start_secs` again.
+    fn loop_back(&mut self) {
+        let Some(region) = self.loop_region.as_mut() else {
+            return;
+        };
+        match region.remaining {
+            Some(0) => {
+                self.clear_loop();
+                return;
+            }
+            Some(left) => region.remaining = Some(left - 1),
+            None => {}
+        }
+        let start_secs = region.start_secs;
+        // A repeated section is not a full listen.
+        self.measuring = None;
+        #[cfg(feature = "analysis")]
+        {
+            self.analysing = None;
+        }
+        let landed = match self.decoder.as_mut().map(|d| d.seek(start_secs)) {
+            Some(Ok(landed)) => landed,
+            Some(Err(message)) => {
+                self.emit(EngineEvent::Error { message });
+                self.clear_loop();
+                return;
+            }
+            None => return,
+        };
+        // Same placement as the gapless join: past whatever is still waiting
+        // to go into the ring, which all belongs to the pass just finished.
+        let pending_frames = self.pending_out.len() as u64 / self.device_channels().max(1) as u64
+            + self.chain.pending_output_frames();
+        self.boundaries.push_back(Boundary {
+            frame: self.frames_written + pending_frames,
+            index: self.queue.index(),
+            duration_secs: self.current_duration,
+            gain_db: self.current_gain_db,
+            offset_secs: landed,
+        });
+        self.emit_loop();
     }
 
     // ── track lifecycle ─────────────────────────────────────────────────
@@ -1034,6 +1255,7 @@ impl Engine {
         // Defensive: every caller already clears this on its own path, but
         // a decoder swap and a crossfade cannot coexist.
         self.transition = None;
+        self.clear_loop();
         let format = decoder.format().clone();
         self.start_measuring(&format);
         self.apply_gain(gain_db);
@@ -1058,6 +1280,7 @@ impl Engine {
             index: self.queue.index(),
             duration_secs: self.current_duration,
             gain_db: self.current_gain_db,
+            offset_secs: 0.0,
         });
 
         self.emit(EngineEvent::Format {
@@ -1141,7 +1364,11 @@ impl Engine {
         // latency; without effects the backlog never reaches this.
         let backlog = self.pending_out.len() >= PUMP_FRAMES * channels * 2;
 
-        self.decode_buf.resize(PUMP_FRAMES * source_channels, 0.0);
+        // An A–B loop caps the read at the loop end, so the jump back below
+        // lands on the exact sample rather than up to a pump buffer late.
+        let loop_frames = self.loop_read_frames();
+        let frames = PUMP_FRAMES.min(loop_frames.unwrap_or(PUMP_FRAMES));
+        self.decode_buf.resize(frames * source_channels, 0.0);
         let read = if backlog {
             0
         } else {
@@ -1188,6 +1415,10 @@ impl Engine {
             if let Err(message) = result {
                 self.emit(EngineEvent::Error { message });
             }
+        }
+
+        if loop_frames.is_some() && self.loop_end_reached() {
+            self.loop_back();
         }
 
         let pushed = self.push_pending(channels);
@@ -1325,7 +1556,13 @@ impl Engine {
     /// enough to its end. Consumes the preloaded decoder when one is ready,
     /// so this costs no probe on the common path.
     fn maybe_start_transition(&mut self) -> bool {
-        if !self.crossfade || self.transition.is_some() || self.mode != Mode::Local {
+        // A loop keeps the track from ending, so a fade into the next one
+        // would pull the listener out of it.
+        if !self.crossfade
+            || self.transition.is_some()
+            || self.mode != Mode::Local
+            || self.loop_region.is_some()
+        {
             return false;
         }
         let Some(next) = self.queue.peek_next().cloned() else {
@@ -1403,6 +1640,7 @@ impl Engine {
         self.decoder = Some(transition.decoder);
         self.resampler = transition.resampler;
         self.chain = transition.chain;
+        self.clear_loop();
         // The adopted mirror starts its timeline fresh from the ring
         // position — the same origin approximation the boundary below makes.
         self.chain.adopt_timeline();
@@ -1417,6 +1655,7 @@ impl Engine {
             index: self.queue.index(),
             duration_secs: self.current_duration,
             gain_db: transition.entry.gain_db,
+            offset_secs: 0.0,
         });
 
         if let Some(format) = self.decoder.as_ref().map(|d| d.format().clone()) {
@@ -1513,6 +1752,7 @@ impl Engine {
             // measured — every gapless-advanced track would keep gain 0
             // forever.
             self.start_measuring(&format);
+            self.clear_loop();
 
             // No flush: whatever is still in the ring belongs to the
             // previous track and must be heard. The boundary tells us when
@@ -1527,6 +1767,7 @@ impl Engine {
                 index: self.queue.index(),
                 duration_secs: self.current_duration,
                 gain_db: next.gain_db,
+                offset_secs: 0.0,
             });
 
             self.emit(EngineEvent::Format {
@@ -1633,21 +1874,20 @@ impl Engine {
             return 0.0;
         }
         let played = self.params.frames_played();
-        let base = self
-            .boundaries
-            .iter()
-            .rev()
-            .find(|b| b.frame <= played)
-            .map(|b| b.frame)
-            .unwrap_or(0);
-        match (self.chain.stream_secs(played), self.chain.stream_secs(base)) {
+        let origin = self.boundaries.iter().rev().find(|b| b.frame <= played);
+        let base = origin.map(|b| b.frame).unwrap_or(0);
+        // Where in the track the origin sits: 0 for a track start, the loop
+        // start for a loop's jump back.
+        let offset = origin.map(|b| b.offset_secs).unwrap_or(0.0);
+        let since_origin = match (self.chain.stream_secs(played), self.chain.stream_secs(base)) {
             (None, None) => (played.saturating_sub(base)) as f64 / rate as f64,
             (played_secs, base_secs) => {
                 let played_secs = played_secs.unwrap_or(played as f64 / rate as f64);
                 let base_secs = base_secs.unwrap_or(base as f64 / rate as f64);
                 (played_secs - base_secs).max(0.0)
             }
-        }
+        };
+        offset + since_origin
     }
 
     fn emit_progress(&mut self) {
@@ -1850,22 +2090,8 @@ mod tests {
     }
 
     /// Collects emitted events, for the tests that assert on the echo.
-    #[cfg(any(
-        feature = "stretch",
-        feature = "fir-eq",
-        feature = "convolution",
-        feature = "analysis",
-        feature = "pitch"
-    ))]
     struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
 
-    #[cfg(any(
-        feature = "stretch",
-        feature = "fir-eq",
-        feature = "convolution",
-        feature = "analysis",
-        feature = "pitch"
-    ))]
     impl crate::EventSink for CaptureSink {
         fn send_event(&self, event: EngineEvent) {
             self.0.lock().unwrap().push(event);
@@ -1873,13 +2099,6 @@ mod tests {
         fn send_frame(&self, _frame: &[u8]) {}
     }
 
-    #[cfg(any(
-        feature = "stretch",
-        feature = "fir-eq",
-        feature = "convolution",
-        feature = "analysis",
-        feature = "pitch"
-    ))]
     fn captured_engine() -> (Engine, Arc<CaptureSink>) {
         let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -2264,6 +2483,386 @@ mod tests {
              else makes position_secs read `played - base = 0` for the rest \
              of the track"
         );
+    }
+
+    fn engine_with_tone(secs: usize) -> Engine {
+        let mut engine = bare_engine();
+        engine.mode = Mode::Local;
+        engine.current_duration = secs as f64;
+        let wav = fixtures::wav_bytes(44_100, 2, &fixtures::tone(44_100, 2, secs * 44_100, 440.0));
+        let mut hint = symphonia::core::formats::probe::Hint::new();
+        hint.with_extension("wav");
+        engine.decoder =
+            Some(Decoder::open(Box::new(std::io::Cursor::new(wav)), hint).expect("wav decodes"));
+        engine
+    }
+
+    #[test]
+    fn relative_seek_target_moves_from_the_playhead_and_clamps_to_the_track() {
+        use SeekDirection::{Backward, Forward};
+        assert_eq!(relative_seek_target(10.0, 5.0, Forward, 60.0), Some(15.0));
+        assert_eq!(relative_seek_target(10.0, 5.0, Backward, 60.0), Some(5.0));
+        assert_eq!(
+            relative_seek_target(2.0, 5.0, Backward, 60.0),
+            Some(0.0),
+            "a backward seek never goes before the start"
+        );
+        assert_eq!(
+            relative_seek_target(58.0, 5.0, Forward, 60.0),
+            Some(60.0),
+            "a forward seek never goes past the end"
+        );
+        assert_eq!(
+            relative_seek_target(58.0, 5.0, Forward, 0.0),
+            Some(63.0),
+            "an unknown duration (0) is no upper bound"
+        );
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                relative_seek_target(10.0, bad, Forward, 60.0),
+                None,
+                "{bad} seconds is not a seek"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_by_rebases_the_playhead_like_an_absolute_seek() {
+        let mut engine = engine_with_tone(3);
+
+        engine.seek_by(2.0, SeekDirection::Forward);
+
+        // No device, so the rate falls back to 1 frame per second and the
+        // counter lands on the target (give or take the packet the accurate
+        // seek snapped to).
+        assert!(engine.frames_written >= 1, "the counter was rebased");
+        assert_eq!(engine.params.frames_played(), engine.frames_written);
+        assert_eq!(engine.boundaries.front().map(|b| b.frame), Some(0));
+    }
+
+    #[test]
+    fn seek_by_past_the_end_clamps_to_the_track_without_an_error() {
+        let (mut engine, sink) = captured_engine();
+        let tone = engine_with_tone(3);
+        engine.mode = Mode::Local;
+        engine.current_duration = tone.current_duration;
+        engine.decoder = tone.decoder;
+
+        engine.seek_by(30.0, SeekDirection::Forward);
+
+        let events = sink.0.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Error { .. })),
+            "clamping to the end must not surface a seek error: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Position { .. })),
+            "the seek reports the new position"
+        );
+    }
+
+    #[test]
+    fn seek_by_before_the_start_lands_at_zero() {
+        let mut engine = engine_with_tone(3);
+        engine.seek(2.0);
+        assert!(engine.frames_written >= 1, "precondition: not at the start");
+
+        engine.seek_by(30.0, SeekDirection::Backward);
+
+        assert_eq!(
+            engine.frames_written, 0,
+            "clamped to the start of the track"
+        );
+        assert_eq!(engine.params.frames_played(), 0);
+    }
+
+    #[test]
+    fn seek_by_ignores_a_station_and_a_bad_amount() {
+        let mut engine = engine_with_tone(3);
+        engine.mode = Mode::Radio;
+        engine.seek_by(2.0, SeekDirection::Forward);
+        assert_eq!(engine.frames_written, 0, "a station cannot be seeked");
+
+        engine.mode = Mode::Local;
+        engine.seek_by(f64::NAN, SeekDirection::Forward);
+        engine.seek_by(-2.0, SeekDirection::Forward);
+        assert_eq!(
+            engine.frames_written, 0,
+            "a bad amount is dropped, not applied"
+        );
+        assert!(
+            engine.boundaries.is_empty(),
+            "a dropped seek must not touch the timeline"
+        );
+    }
+
+    // ── A–B loop ────────────────────────────────────────────────────────
+
+    /// A ramp short enough that neighbouring frames decode to distinct
+    /// values, so a test can tell exactly which source frame it is hearing.
+    const RAMP_FRAMES: usize = 4000;
+
+    fn ramp_value(frame: usize) -> f32 {
+        ((frame as f32 / RAMP_FRAMES as f32) * 30_000.0) as i16 as f32 / 32_768.0
+    }
+
+    fn ramp_secs(frame: usize) -> f64 {
+        frame as f64 / 44_100.0
+    }
+
+    /// A playing engine over the ramp, with a ring to pump into and a sink
+    /// capturing the echoes. No device, so the ring is drained by hand.
+    fn looping_engine() -> (Engine, Arc<CaptureSink>, rtrb::Consumer<f32>) {
+        let (mut engine, sink) = captured_engine();
+        engine.mode = Mode::Local;
+        engine.playing = true;
+        engine.current_duration = ramp_secs(RAMP_FRAMES);
+        let wav = fixtures::wav_bytes(44_100, 2, &fixtures::ramp(2, RAMP_FRAMES));
+        let mut hint = symphonia::core::formats::probe::Hint::new();
+        hint.with_extension("wav");
+        engine.decoder =
+            Some(Decoder::open(Box::new(std::io::Cursor::new(wav)), hint).expect("wav decodes"));
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(48_000 * 4);
+        engine.producer = Some(producer);
+        (engine, sink, consumer)
+    }
+
+    /// Pumps until the track ends or `max_frames` have reached the ring,
+    /// playing the callback's part (draining the ring, finishing flushes).
+    /// Returns the left channel of what was heard.
+    fn heard(
+        engine: &mut Engine,
+        consumer: &mut rtrb::Consumer<f32>,
+        max_frames: usize,
+    ) -> Vec<f32> {
+        let mut out = Vec::new();
+        for _ in 0..100_000 {
+            engine.params.finish_flush();
+            engine.pump();
+            while let Ok(sample) = consumer.pop() {
+                out.push(sample);
+            }
+            if engine.decoder.is_none() || out.len() / 2 >= max_frames {
+                break;
+            }
+        }
+        out.iter().step_by(2).copied().collect()
+    }
+
+    fn assert_heard_frames(heard: &[f32], expected: impl Iterator<Item = usize>) {
+        let expected: Vec<usize> = expected.collect();
+        assert_eq!(heard.len(), expected.len(), "frames heard");
+        for (i, (sample, frame)) in heard.iter().zip(&expected).enumerate() {
+            assert!(
+                (sample - ramp_value(*frame)).abs() < 1e-4,
+                "output frame {i} is {sample}, not source frame {frame} ({})",
+                ramp_value(*frame)
+            );
+        }
+    }
+
+    fn loop_events(sink: &CaptureSink) -> Vec<(bool, f64, f64, Option<u32>)> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Loop {
+                    enabled,
+                    start_secs,
+                    end_secs,
+                    repeats_left,
+                } => Some((*enabled, *start_secs, *end_secs, *repeats_left)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn set_loop_jumps_to_the_start_and_echoes_the_region() {
+        let (mut engine, sink) = captured_engine();
+        let tone = engine_with_tone(3);
+        engine.mode = Mode::Local;
+        engine.current_duration = tone.current_duration;
+        engine.decoder = tone.decoder;
+
+        engine.set_loop(2.0, 3.0, Some(2));
+
+        assert_eq!(loop_events(&sink), vec![(true, 2.0, 3.0, Some(2))]);
+        assert!(
+            engine.params.frames_played() >= 1,
+            "the playhead was rebased to the loop start (1 frame/s with no device)"
+        );
+
+        engine.describe();
+        assert_eq!(
+            loop_events(&sink).len(),
+            2,
+            "describe re-emits the loop so a reloaded UI recovers it"
+        );
+    }
+
+    #[test]
+    fn an_invalid_loop_region_is_rejected_with_an_error() {
+        let (mut engine, sink, _consumer) = looping_engine();
+        for (start, end) in [
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (f64::NAN, 1.0),
+            (0.0, f64::INFINITY),
+        ] {
+            engine.set_loop(start, end, None);
+            assert!(
+                engine.loop_region.is_none(),
+                "{start}..{end} is not a region"
+            );
+        }
+        let errors = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Error { .. }))
+            .count();
+        assert_eq!(errors, 5, "each rejection is reported");
+        assert!(loop_events(&sink).is_empty(), "nothing to echo");
+    }
+
+    #[test]
+    fn a_loop_repeats_the_section_sample_exactly_then_plays_on() {
+        let (mut engine, sink, mut consumer) = looping_engine();
+        engine.set_loop(ramp_secs(1000), ramp_secs(2000), Some(1));
+
+        let out = heard(&mut engine, &mut consumer, usize::MAX);
+
+        // 1000..2000 twice — the jump lands on frame 1000 exactly, with no
+        // frame lost or doubled at the seam — then the rest of the track.
+        assert_heard_frames(
+            &out,
+            (1000..2000).chain(1000..2000).chain(2000..RAMP_FRAMES),
+        );
+        assert!(engine.decoder.is_none(), "the track ran to its end");
+        assert!(
+            engine.loop_region.is_none(),
+            "a finished loop clears itself"
+        );
+        assert_eq!(
+            loop_events(&sink),
+            vec![
+                (true, ramp_secs(1000), ramp_secs(2000), Some(1)),
+                (true, ramp_secs(1000), ramp_secs(2000), Some(0)),
+                (false, 0.0, 0.0, None),
+            ],
+            "set, one jump back, then cleared on reaching the end again"
+        );
+        assert!(
+            engine
+                .boundaries
+                .iter()
+                .any(|b| (b.offset_secs - ramp_secs(1000)).abs() < 1e-9),
+            "the jump back leaves a boundary carrying the loop start as its offset"
+        );
+    }
+
+    #[test]
+    fn a_zero_repeat_loop_plays_the_section_once_from_its_start() {
+        let (mut engine, _sink, mut consumer) = looping_engine();
+        engine.set_loop(ramp_secs(1000), ramp_secs(2000), Some(0));
+
+        let out = heard(&mut engine, &mut consumer, usize::MAX);
+
+        assert_heard_frames(&out, 1000..RAMP_FRAMES);
+        assert!(engine.loop_region.is_none());
+    }
+
+    #[test]
+    fn a_loop_past_the_end_of_the_track_loops_at_the_end() {
+        let (mut engine, _sink, mut consumer) = looping_engine();
+        engine.set_loop(ramp_secs(3000), 60.0, Some(1));
+
+        let out = heard(&mut engine, &mut consumer, usize::MAX);
+
+        assert_heard_frames(&out, (3000..RAMP_FRAMES).chain(3000..RAMP_FRAMES));
+        assert!(engine.decoder.is_none(), "and then the track ends normally");
+    }
+
+    #[test]
+    fn a_loop_without_a_count_repeats_until_cleared() {
+        let (mut engine, _sink, mut consumer) = looping_engine();
+        engine.set_loop(ramp_secs(1000), ramp_secs(2000), None);
+
+        // Three times the whole file's length, all of it inside the region.
+        let out = heard(&mut engine, &mut consumer, RAMP_FRAMES * 3);
+        assert!(out.len() >= RAMP_FRAMES * 3);
+        assert!(engine.decoder.is_some(), "still playing");
+        assert!(engine.loop_region.is_some(), "still looping");
+        let expected = (0..out.len()).map(|i| 1000 + i % 1000);
+        assert_heard_frames(&out, expected);
+
+        engine.clear_loop();
+        let rest = heard(&mut engine, &mut consumer, usize::MAX);
+        assert!(
+            engine.decoder.is_none(),
+            "cleared, the track runs to its end"
+        );
+        assert!(
+            (rest.last().copied().unwrap() - ramp_value(RAMP_FRAMES - 1)).abs() < 1e-4,
+            "ending on the last frame of the file"
+        );
+    }
+
+    #[test]
+    fn a_seek_outside_the_region_plays_on_past_the_end() {
+        let (mut engine, _sink, mut consumer) = looping_engine();
+        engine.set_loop(ramp_secs(1000), ramp_secs(2000), None);
+        engine.seek(ramp_secs(2500));
+
+        let out = heard(&mut engine, &mut consumer, usize::MAX);
+
+        assert_heard_frames(&out, 2500..RAMP_FRAMES);
+        assert!(
+            engine.decoder.is_none(),
+            "no snap back from outside the region"
+        );
+    }
+
+    #[test]
+    fn stopping_clears_the_loop() {
+        let (mut engine, sink, _consumer) = looping_engine();
+        engine.set_loop(ramp_secs(1000), ramp_secs(2000), None);
+
+        engine.stop();
+
+        assert!(engine.loop_region.is_none());
+        assert_eq!(
+            loop_events(&sink).last().copied(),
+            Some((false, 0.0, 0.0, None))
+        );
+    }
+
+    #[test]
+    fn no_crossfade_starts_while_a_loop_is_active() {
+        let (mut engine, _consumer, path0, path1) = crossfading_engine("janis-crossfade-loop-test");
+        engine.loop_region = Some(LoopRegion {
+            start_secs: 0.0,
+            end_secs: 0.5,
+            remaining: None,
+        });
+
+        engine.pump();
+
+        let _ = std::fs::remove_file(&path0);
+        let _ = std::fs::remove_file(&path1);
+        assert!(
+            engine.transition.is_none(),
+            "a loop keeps the track from ending, so nothing fades in over it"
+        );
+        assert_eq!(engine.queue.index(), 0);
     }
 
     fn missing_entries(count: usize) -> Vec<QueueEntry> {
@@ -2819,12 +3418,14 @@ mod tests {
             index: 0,
             duration_secs: 10.0,
             gain_db: 0.0,
+            offset_secs: 0.0,
         });
         engine.boundaries.push_back(Boundary {
             frame: 1000,
             index: 1,
             duration_secs: 20.0,
             gain_db: -3.0,
+            offset_secs: 0.0,
         });
 
         engine.params.reset_frames(999);
