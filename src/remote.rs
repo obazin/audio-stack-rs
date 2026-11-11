@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use stream_download::http::reqwest::{self, Client};
-use stream_download::http::HttpStream;
+use stream_download::http::{HttpStream, HttpStreamError};
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use symphonia::core::formats::probe::Hint;
@@ -88,9 +88,13 @@ async fn connect(remote: &RemoteFile) -> Result<(Box<dyn MediaSource>, Hint), St
 
     // An HTTP error status (a missing item, a revoked token) fails here, so it
     // reaches the listener as an unplayable track rather than as silence.
-    let stream = HttpStream::new(client, parsed)
-        .await
-        .map_err(|error| scrub(format!("connect to {shown}: {error}")))?;
+    let stream = HttpStream::new(client, parsed).await.map_err(|error| {
+        let reason = match error {
+            HttpStreamError::FetchFailure(error) => reason(&error),
+            HttpStreamError::ResponseFailure(error) => reason(error.source()),
+        };
+        scrub(format!("{shown}: {reason}"))
+    })?;
     let content_type = stream
         .content_type()
         .as_ref()
@@ -118,6 +122,20 @@ async fn connect(remote: &RemoteFile) -> Result<(Box<dyn MediaSource>, Hint), St
     }
 
     Ok((Box::new(RemoteSource { reader, length }), hint))
+}
+
+/// Why a request failed, in a few words a listener can read: the transport
+/// error's own text names the address again, query included.
+fn reason(error: &reqwest::Error) -> String {
+    if let Some(status) = error.status() {
+        format!("the server answered {status}")
+    } else if error.is_connect() {
+        "the server does not answer".to_owned()
+    } else if error.is_timeout() {
+        "the server took too long to answer".to_owned()
+    } else {
+        error.to_string()
+    }
 }
 
 /// Opens a decoder over a remote file, waiting for the connect. Called from
@@ -275,7 +293,26 @@ mod tests {
         let error = open_blocking(&remote(&address, "/missing.flac"), runtime().handle())
             .err()
             .expect("a 404 does not open");
-        assert!(!error.contains("secret"), "credentials leaked: {error}");
+        assert_eq!(
+            error,
+            format!("{address}/missing.flac: the server answered 404 Not Found")
+        );
+    }
+
+    #[test]
+    fn a_server_that_is_not_there_says_so_briefly() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let address = format!("http://127.0.0.1:{port}");
+        let error = open_blocking(&remote(&address, "/track.wav"), runtime().handle())
+            .err()
+            .expect("nothing listens there");
+        assert_eq!(
+            error,
+            format!("{address}/track.wav: the server does not answer")
+        );
     }
 
     #[test]
