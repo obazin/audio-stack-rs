@@ -15,7 +15,9 @@
 //!   lock-free ring, runs the EQ and gain, and taps a mono copy for the
 //!   analyser. It never allocates, locks, blocks — or logs.
 //! - A small **owned tokio runtime** drives the detached network tasks
-//!   (reconnect, now-playing pollers). The one async entry point,
+//!   (reconnect, now-playing pollers) and the downloads of remote queue
+//!   entries, which a short-lived opener thread connects so the engine thread
+//!   never waits on a server while audio is playing. The one async entry point,
 //!   [`AudioEngine::play_stream`], is driven by the caller's runtime.
 
 mod analyser;
@@ -41,6 +43,7 @@ mod params;
 #[cfg(feature = "pitch")]
 mod pitch;
 mod queue;
+mod remote;
 mod resample;
 mod spectral;
 mod stream;
@@ -71,7 +74,7 @@ pub use metadata::{
 pub use nowplaying::Source;
 pub use output::AudioDevice;
 pub use params::{CENTER_FREQS, EQ_BAND_COUNT};
-pub use queue::QueueEntry;
+pub use queue::{Location, QueueEntry, RemoteFile};
 
 /// Where the engine sends what the host renders: transport [`EngineEvent`]s and
 /// the raw visual frame (`FRAME_BYTES` bytes, ~60 Hz). The host implements this

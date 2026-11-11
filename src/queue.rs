@@ -11,16 +11,66 @@
 
 use std::path::PathBuf;
 
+/// Where a queued track's bytes come from.
+///
+/// Deserializes from a plain string (a file path) or from an object with a
+/// `url`, so a host payload written before remote tracks existed still loads.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum Location {
+    /// An audio file on disk.
+    File(PathBuf),
+    /// A whole audio file served over HTTP — a media server's original file,
+    /// not a live station. It is buffered to a temporary file and seeked with
+    /// range requests, so it plays exactly like a local file: seek, gapless,
+    /// crossfade and loudness measurement all apply.
+    Remote(RemoteFile),
+}
+
+/// A finite audio file on a server.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct RemoteFile {
+    /// The address to fetch it from, credentials included when the server
+    /// takes them in the query.
+    pub url: String,
+    /// The file's extension (`flac`, `mp3`, …), when known: a better format
+    /// hint than a vague `Content-Type`.
+    #[serde(default)]
+    pub extension: Option<String>,
+}
+
+impl From<PathBuf> for Location {
+    fn from(path: PathBuf) -> Self {
+        Location::File(path)
+    }
+}
+
+impl std::fmt::Display for Location {
+    /// A file shows its path; a remote file shows its address without the
+    /// query, which may carry credentials that do not belong in a log.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Location::File(path) => write!(formatter, "{}", path.display()),
+            Location::Remote(remote) => {
+                let address = remote.url.split('?').next().unwrap_or_default();
+                write!(formatter, "{address}")
+            }
+        }
+    }
+}
+
 /// One entry in the queue. Carries what playback needs and nothing else — the
 /// host already has the full track. Deserializes directly from a host's queue
-/// payload (camelCase; `path` from a plain string), so no shim type is needed.
+/// payload (camelCase; `location`, or `path` from a plain string), so no shim
+/// type is needed.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueEntry {
     /// The host's stable id for this track.
     pub track_id: i64,
-    /// Path to the audio file on disk.
-    pub path: PathBuf,
+    /// Where the audio is: a file on disk or a file on a server.
+    #[serde(alias = "path")]
+    pub location: Location,
     /// Duration, in seconds, as known by the host.
     pub duration_secs: f64,
     /// Normalization gain in dB, resolved when the queue was loaded. Defaulted
@@ -227,11 +277,39 @@ mod tests {
         (0..count)
             .map(|i| QueueEntry {
                 track_id: i as i64,
-                path: PathBuf::from(format!("/music/{i}.flac")),
+                location: PathBuf::from(format!("/music/{i}.flac")).into(),
                 duration_secs: 100.0,
                 gain_db: 0.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_payload_with_a_plain_path_still_loads_as_a_file() {
+        let entry: QueueEntry =
+            serde_json::from_str(r#"{"trackId": 1, "path": "/music/a.flac", "durationSecs": 3.0}"#)
+                .expect("an older payload deserializes");
+        assert_eq!(
+            entry.location,
+            Location::File(PathBuf::from("/music/a.flac"))
+        );
+    }
+
+    #[test]
+    fn a_payload_with_a_url_loads_as_a_remote_file() {
+        let entry: QueueEntry = serde_json::from_str(
+            r#"{"trackId": 2, "location": {"url": "http://server/a?key=secret", "extension": "flac"}, "durationSecs": 3.0}"#,
+        )
+        .expect("a remote payload deserializes");
+        let Location::Remote(remote) = &entry.location else {
+            panic!("expected a remote location");
+        };
+        assert_eq!(remote.extension.as_deref(), Some("flac"));
+        assert_eq!(
+            entry.location.to_string(),
+            "http://server/a",
+            "the credentials in the query stay out of what is shown"
+        );
     }
 
     fn queue(count: usize, index: usize) -> Queue {

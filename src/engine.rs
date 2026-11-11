@@ -23,7 +23,8 @@ use super::loudness::{self, Loudness, Store};
 use super::nowplaying::Update;
 use super::output::{self, Output};
 use super::params::Params;
-use super::queue::{Queue, QueueEntry};
+use super::queue::{Location, Queue, QueueEntry};
+use super::remote;
 use super::resample::Resampler;
 use super::stream::{NowPlaying, RadioStream};
 use crate::EventSink;
@@ -279,6 +280,10 @@ pub struct Engine {
     decoder: Option<Decoder>,
     /// Opened early so a gapless transition costs no probe or allocation.
     preloaded: Option<Decoder>,
+    /// A remote next track being opened off the engine thread, by its track
+    /// id. Kept after a failed open (its channel then reads disconnected) so
+    /// the same track is not retried on every pump.
+    preloading: Option<(i64, std::sync::mpsc::Receiver<Result<Decoder, String>>)>,
     /// Written by the ICY reader as the station announces tracks.
     now_playing: Option<NowPlaying>,
     reported_title: Option<String>,
@@ -369,6 +374,7 @@ impl Engine {
             pending_pause: false,
             decoder: None,
             preloaded: None,
+            preloading: None,
             now_playing: None,
             reported_title: None,
             normalize: true,
@@ -948,6 +954,7 @@ impl Engine {
         self.station_epoch.fetch_add(1, Ordering::Relaxed);
         self.decoder = None;
         self.preloaded = None;
+        self.preloading = None;
         self.pending_out.clear();
         self.chain.reset();
         self.boundaries.clear();
@@ -1196,7 +1203,7 @@ impl Engine {
                 self.stop();
                 return;
             };
-            match Decoder::open_file(&entry.path) {
+            match self.open_entry(&entry) {
                 Ok(decoder) => {
                     self.current_duration = decoder
                         .format()
@@ -1268,6 +1275,7 @@ impl Engine {
         }
         self.decoder = Some(decoder);
         self.preloaded = None;
+        self.preloading = None;
 
         self.params.request_flush();
         self.pending_out.clear();
@@ -1318,12 +1326,45 @@ impl Engine {
         // wall-clock time until the decoder is needed.
         let remaining =
             (self.current_duration - self.position_secs()) / self.chain.time_ratio().max(0.01);
-        if self.preloaded.is_none() && remaining <= PRELOAD_SECS {
-            match Decoder::open_file(&next.path) {
+        if self.preloaded.is_some() || remaining > PRELOAD_SECS {
+            return;
+        }
+        match &next.location {
+            Location::File(path) => match Decoder::open_file(path) {
                 Ok(decoder) => self.preloaded = Some(decoder),
                 // Not fatal: the transition just falls back to opening late.
                 Err(message) => log::warn!("preload failed: {}", message),
-            }
+            },
+            // A connect can take a while, and the engine thread is what keeps
+            // the ring fed: the next remote track opens on a thread of its
+            // own and is collected here once it is ready.
+            Location::Remote(remote_file) => match &self.preloading {
+                Some((track_id, receiver)) if *track_id == next.track_id => {
+                    match receiver.try_recv() {
+                        Ok(Ok(decoder)) => {
+                            self.preloaded = Some(decoder);
+                            self.preloading = None;
+                        }
+                        Ok(Err(message)) => log::warn!("preload failed: {}", message),
+                        Err(_) => {}
+                    }
+                }
+                _ => {
+                    self.preloading = Some((
+                        next.track_id,
+                        remote::open_in_background(remote_file.clone(), self.runtime.clone()),
+                    ));
+                }
+            },
+        }
+    }
+
+    /// Opens a queued track where it lives. A remote one waits for the
+    /// server, which is only done here where a decoder is needed now.
+    fn open_entry(&self, entry: &QueueEntry) -> Result<Decoder, String> {
+        match &entry.location {
+            Location::File(path) => Decoder::open_file(path),
+            Location::Remote(remote_file) => remote::open_blocking(remote_file, &self.runtime),
         }
     }
 
@@ -1576,9 +1617,10 @@ impl Engine {
             return false;
         }
 
+        self.preloading = None;
         let decoder = match self.preloaded.take() {
             Some(decoder) => decoder,
-            None => match Decoder::open_file(&next.path) {
+            None => match self.open_entry(&next) {
                 Ok(decoder) => decoder,
                 Err(message) => {
                     // Not fatal: the join just falls back to whatever
@@ -1715,9 +1757,10 @@ impl Engine {
             };
             self.queue.advance();
 
+            self.preloading = None;
             let decoder = match self.preloaded.take() {
                 Some(decoder) => Some(decoder),
-                None => match Decoder::open_file(&next.path) {
+                None => match self.open_entry(&next) {
                     Ok(decoder) => Some(decoder),
                     Err(message) => {
                         self.emit(EngineEvent::Error { message });
@@ -2869,7 +2912,8 @@ mod tests {
         (0..count)
             .map(|i| QueueEntry {
                 track_id: i as i64,
-                path: std::path::PathBuf::from(format!("/nonexistent/janis-test-{i}.flac")),
+                location: std::path::PathBuf::from(format!("/nonexistent/janis-test-{i}.flac"))
+                    .into(),
                 duration_secs: 1.0,
                 gain_db: 0.0,
             })
@@ -3015,6 +3059,52 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_next_track_is_preloaded_off_the_engine_thread() {
+        let address = crate::remote::test_server::serve(fixtures::wav_bytes(
+            8_000,
+            1,
+            &fixtures::silence(1, 8_000),
+        ));
+        let mut engine = bare_engine();
+        engine.queue.load(
+            vec![
+                QueueEntry {
+                    track_id: 1,
+                    location: std::path::PathBuf::from("/nonexistent/playing.wav").into(),
+                    duration_secs: 1.0,
+                    gain_db: 0.0,
+                },
+                QueueEntry {
+                    track_id: 2,
+                    location: Location::Remote(crate::RemoteFile {
+                        url: format!("{address}/track.wav?api_key=secret"),
+                        extension: Some("wav".to_owned()),
+                    }),
+                    duration_secs: 1.0,
+                    gain_db: 0.0,
+                },
+            ],
+            0,
+        );
+        engine.mode = Mode::Local;
+        // The playing track is within the preload window.
+        engine.current_duration = 1.0;
+
+        engine.refresh_preload();
+        assert!(
+            engine.preloaded.is_none() && engine.preloading.is_some(),
+            "the first call starts the open and returns at once"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.preloaded.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            engine.refresh_preload();
+        }
+        assert!(engine.preloaded.is_some(), "the remote decoder arrives");
+        assert!(engine.preloading.is_none());
+    }
+
+    #[test]
     fn a_gapless_advance_starts_measuring_the_incoming_track() {
         let dir = std::env::temp_dir().join("janis-gapless-measure-test");
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -3029,13 +3119,13 @@ mod tests {
             vec![
                 QueueEntry {
                     track_id: 1,
-                    path: std::path::PathBuf::from("/nonexistent/finished.wav"),
+                    location: std::path::PathBuf::from("/nonexistent/finished.wav").into(),
                     duration_secs: 1.0,
                     gain_db: 0.0,
                 },
                 QueueEntry {
                     track_id: 2,
-                    path: path.clone(),
+                    location: path.clone().into(),
                     duration_secs: 0.1,
                     gain_db: 0.0,
                 },
@@ -3090,7 +3180,7 @@ mod tests {
             path.clone(),
             QueueEntry {
                 track_id,
-                path,
+                location: path.into(),
                 duration_secs: 1.0,
                 gain_db: 0.0,
             },
@@ -3120,7 +3210,7 @@ mod tests {
         engine.crossfade = true;
         engine.current_duration = 1.0;
         engine.queue.load(vec![entry0.clone(), entry1], 0);
-        engine.decoder = Some(Decoder::open_file(&entry0.path).expect("wav decodes"));
+        engine.decoder = Some(engine.open_entry(&entry0).expect("wav decodes"));
 
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(48_000 * 4);
         engine.producer = Some(producer);
@@ -3485,7 +3575,7 @@ mod tests {
         engine.load_queue(
             vec![QueueEntry {
                 track_id: 1,
-                path: path.clone(),
+                location: path.clone().into(),
                 duration_secs: 2.0,
                 gain_db: 0.0,
             }],
@@ -3533,7 +3623,7 @@ mod tests {
         engine.load_queue(
             vec![QueueEntry {
                 track_id: 1,
-                path: path.clone(),
+                location: path.clone().into(),
                 duration_secs: 4.0,
                 gain_db: 0.0,
             }],

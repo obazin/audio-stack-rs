@@ -45,7 +45,7 @@ fn main() {
     engine.load_queue(
         vec![QueueEntry {
             track_id: 1,
-            path: dry_path.clone(),
+            location: dry_path.clone().into(),
             duration_secs: 12.0,
             gain_db: 0.0,
         }],
