@@ -182,6 +182,40 @@ impl Loudness {
     }
 }
 
+/// How many interleaved samples [`measure_file`] decodes at a time: about a
+/// tenth of a second of stereo at 48 kHz, so memory stays flat on any length.
+const MEASURE_CHUNK: usize = 8_192;
+
+/// Measures a whole file's loudness, decoding it as fast as the processor
+/// allows. The same EBU R128 meter the engine runs during playback, for a host
+/// that wants every track measured before it is first heard.
+///
+/// Blocking and processor-bound: call it from a worker thread, never from the
+/// engine thread or a user-interface thread. Fails on a file that cannot be
+/// decoded, one too short or too quiet to gate, and one whose sample rate or
+/// channel count changes part-way, which the meter cannot follow.
+pub fn measure_file(path: &std::path::Path) -> Result<Measured, String> {
+    let mut decoder = crate::decode::Decoder::open_file(path)?;
+    let format = decoder.format().clone();
+    let mut meter = Loudness::new(format.sample_rate, format.channels)
+        .ok_or_else(|| format!("no loudness meter for {}", path.display()))?;
+    let mut buffer = vec![0.0f32; MEASURE_CHUNK];
+    loop {
+        let read = decoder.read(&mut buffer)?;
+        let now = decoder.format();
+        if now.sample_rate != format.sample_rate || now.channels != format.channels {
+            return Err(format!("format changes inside {}", path.display()));
+        }
+        meter.feed(&buffer[..read]);
+        if read < buffer.len() {
+            break;
+        }
+    }
+    meter
+        .finish()
+        .ok_or_else(|| format!("too short or silent to measure: {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +440,52 @@ mod tests {
             (clean - ragged).abs() < 0.05,
             "one trimmed sample must not move the measurement: clean {clean}, ragged {ragged}"
         );
+    }
+
+    /// Writes a fixture WAV into its own temporary directory.
+    fn fixture_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "audio-stack-measure-{}-{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("fixture directory");
+        let path = directory.join(format!("{name}.wav"));
+        std::fs::write(&path, bytes).expect("fixture file");
+        path
+    }
+
+    #[test]
+    fn a_file_measures_like_the_same_audio_fed_live() {
+        use crate::fixtures::{tone, wav_bytes};
+        let samples = tone(48_000, 2, 48_000 * 3, 1000.0);
+        let path = fixture_file("tone", &wav_bytes(48_000, 2, &samples));
+
+        let from_file = measure_file(&path).expect("a three-second tone measures");
+
+        let mut live = Loudness::new(48_000, 2).expect("meter");
+        let floats: Vec<f32> = samples.iter().map(|&s| f32::from(s) / 32_768.0).collect();
+        live.feed(&floats);
+        let live = live.finish().expect("three seconds gate");
+
+        assert!(
+            (from_file.lufs - live.lufs).abs() < 0.05,
+            "file {} LUFS against live {} LUFS",
+            from_file.lufs,
+            live.lufs
+        );
+        assert!(from_file.peak > 0.0);
+    }
+
+    #[test]
+    fn a_silent_file_is_refused_rather_than_given_a_gain() {
+        use crate::fixtures::{silence, wav_bytes};
+        let path = fixture_file("silence", &wav_bytes(48_000, 2, &silence(2, 48_000 * 2)));
+        assert!(measure_file(&path).is_err());
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error() {
+        assert!(measure_file(std::path::Path::new("/nowhere/at/all.flac")).is_err());
     }
 }

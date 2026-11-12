@@ -66,7 +66,9 @@ use engine::{Engine, EngineCommand};
 
 pub use analyser::FRAME_BYTES;
 pub use events::{EngineEvent, Mode, SeekDirection};
-pub use loudness::{db_to_linear, gain_db, parse_gain_db, parse_peak, Measured, Store};
+pub use loudness::{
+    db_to_linear, gain_db, measure_file, parse_gain_db, parse_peak, Measured, Store,
+};
 pub use metadata::{
     audio_extension, read_cover, read_metadata, CoverArt, Metadata, AUDIO_EXTENSIONS,
     LOSSLESS_EXTENSIONS,

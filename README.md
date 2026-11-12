@@ -8,7 +8,7 @@ It was extracted from the [Janis](https://github.com/obazin/janis) desktop playe
 
 - **Playback engine** — a dedicated engine thread decodes with [symphonia](https://crates.io/crates/symphonia) (plus a bundled libopus-backed Opus decoder), resamples with [rubato](https://crates.io/crates/rubato) only when the file and device rates differ, runs a 10-band biquad EQ, and feeds a lock-free ring drained by a [cpal](https://crates.io/crates/cpal) realtime callback. The callback never allocates, locks, or blocks.
 - **Gapless, crossfade, or a deliberate gap** — track joins happen in-ring for true gapless play, or overlap with an equal-power crossfade, or flush to a clean brief silence — your choice at runtime.
-- **Volume normalization** — EBU R128 ([ebur128](https://crates.io/crates/ebur128)) measured while a track plays, or ReplayGain tags where present. You provide a `Store` for persistence; the library fills the answer in as tracks are heard.
+- **Volume normalization** — EBU R128 ([ebur128](https://crates.io/crates/ebur128)) measured while a track plays, or ReplayGain tags where present. You provide a `Store` for persistence; the library fills the answer in as tracks are heard. `measure_file` measures a whole file ahead of time, decoding faster than real time on a thread of your choosing, so a host can give every track a gain before it is first heard.
 - **Media-server tracks** — a queue entry can be a whole file on a server (`Location::Remote`): downloaded into a temporary file as it plays, seeked with HTTP range requests, and opened off the engine thread when preloaded, so it plays exactly like a local file — seek, gapless, crossfade and loudness measurement included.
 - **Web radio** — an HTTP stream buffered into the same decode path as a local file, with automatic reconnect/backoff, Icecast/Shoutcast ICY titles, and pluggable now-playing providers (SomaFM, Radio France, Radio Paradise) whose cover art is fetched over an https host allowlist.
 - **Time-stretch** *(opt-in `stretch` feature)* — live tempo control (0.25×–2×) with pitch preserved, toggled and adjusted during playback without a click via an effect chain in the decode path. The playhead stays correct while stretched.
@@ -142,7 +142,7 @@ let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>
 ## Development
 
 ```sh
-cargo test                                   # 176 unit tests (189 with --features stretch, 235 with --all-features); device/network tests are #[ignore]d
+cargo test                                   # the unit tests (more with --features stretch or --all-features); device/network tests are #[ignore]d
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
