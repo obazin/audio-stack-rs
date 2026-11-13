@@ -39,6 +39,7 @@ mod nowplaying;
 #[cfg(feature = "opus")]
 mod opus;
 mod output;
+mod overview;
 mod params;
 #[cfg(feature = "pitch")]
 mod pitch;
@@ -75,6 +76,7 @@ pub use metadata::{
 };
 pub use nowplaying::Source;
 pub use output::AudioDevice;
+pub use overview::{OverviewSlice, OVERVIEW_SLICES_PER_SECOND};
 pub use params::{CENTER_FREQS, EQ_BAND_COUNT};
 pub use queue::{Location, QueueEntry, RemoteFile};
 
@@ -327,6 +329,30 @@ impl AudioEngine {
     /// this is the raw counter, handy for telemetry and tests.
     pub fn frames_played(&self) -> u64 {
         self.params.frames_played()
+    }
+
+    // ── track overview ────────────────────────────────────────────────────────
+
+    /// Reads the whole track at `location` into its overview: one
+    /// [`OverviewSlice`] per hundredth of a second
+    /// ([`OVERVIEW_SLICES_PER_SECOND`]), the shape a DAW draws of an audio
+    /// clip. The slices reach `on_slices` in batches while the track decodes,
+    /// in order, so a host can draw it as it arrives; returning
+    /// [`ControlFlow::Break`](std::ops::ControlFlow::Break) stops the read.
+    /// Returns `Ok(true)` once the track was read to its end, `Ok(false)` when
+    /// `on_slices` stopped it.
+    ///
+    /// A file is decoded as fast as the processor allows; a remote file is
+    /// downloaded for the purpose, through the engine's network runtime,
+    /// independently of any playback of the same address. Blocking: call it
+    /// from a worker thread, never from the engine thread, a runtime thread or
+    /// a user-interface thread. It touches nothing the engine plays.
+    pub fn read_overview(
+        &self,
+        location: &Location,
+        on_slices: &mut dyn FnMut(&[OverviewSlice]) -> std::ops::ControlFlow<()>,
+    ) -> Result<bool, String> {
+        overview::read(location, &self.handle, on_slices)
     }
 
     // ── output devices ────────────────────────────────────────────────────────
