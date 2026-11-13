@@ -90,8 +90,12 @@ impl Decoder {
             .as_ref()
             .map(|c| c.count())
             .unwrap_or(0) as u16;
-        let duration_secs = track
-            .num_frames
+        // A header that counts no frames at all was written before the
+        // encoder knew the length — a live transcode streamed by a media
+        // server writes its MP3 Xing header that way. It is no length, and
+        // trimming against it would cut every sample as padding.
+        let counted_frames = track.num_frames.filter(|frames| *frames > 0);
+        let duration_secs = counted_frames
             .filter(|_| sample_rate > 0)
             .map(|frames| frames as f64 / sample_rate as f64)
             .or_else(|| {
@@ -104,9 +108,12 @@ impl Decoder {
         // correctness, not the engine's Gapless *playback* switch (which
         // instead chooses whether a track boundary joins in-ring or flushes
         // to a gap, see `engine::Engine::gapless`) — trimming stays on
-        // unconditionally, because a file with untrimmed padding is wrong
-        // audio regardless of how the listener wants tracks to join.
-        let decoder_options = AudioDecoderOptions::default().gapless(true);
+        // whatever the switch says, because a file with untrimmed padding is
+        // wrong audio regardless of how the listener wants tracks to join.
+        // Only a header that counts zero frames turns it off: there is no end
+        // to trim against.
+        let decoder_options = AudioDecoderOptions::default()
+            .gapless(track.num_frames.is_none() || counted_frames.is_some());
         let decoder = super::codecs::get_codecs()
             .make_audio_decoder(audio_params, &decoder_options)
             .map_err(|e| format!("no decoder for this codec: {}", e))?;
