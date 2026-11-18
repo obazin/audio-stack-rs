@@ -136,8 +136,19 @@ impl AudioEngine {
     /// Reopens the current queued source and seeks before installing it.
     /// Preserves queue order and track identity; `playing` selects the state
     /// after opening. The host decides when a source needs refreshing.
+    /// A successful installation confirms the reanchored position with
+    /// [`EngineEvent::Seeked`], including when the logical point is unchanged.
     pub fn refresh_current(&self, position_secs: f64, playing: bool) {
         let _ = self.send(EngineCommand::RefreshCurrent {
+            position_secs,
+            playing,
+        });
+    }
+    /// Like [`refresh_current`](Self::refresh_current), but atomically ignored
+    /// if local playback no longer has `track_id` when the engine executes it.
+    pub fn refresh_track(&self, track_id: i64, position_secs: f64, playing: bool) {
+        let _ = self.send(EngineCommand::RefreshTrack {
+            track_id,
             position_secs,
             playing,
         });
@@ -213,8 +224,20 @@ impl AudioEngine {
         let _ = self.send(EngineCommand::JumpTo(index));
     }
     /// Seeks the current track to `position_secs`.
+    /// Success is confirmed by [`EngineEvent::Seeked`] after positioning,
+    /// including when the source is still opening.
     pub fn seek(&self, position_secs: f64) {
         let _ = self.send(EngineCommand::Seek(position_secs));
+    }
+    /// Seeks only if local playback still has `track_id` when the engine
+    /// executes this command. A stale identity is ignored atomically, so a
+    /// queued track change cannot redirect the seek to a different track.
+    /// Successful seeks are confirmed by [`EngineEvent::Seeked`].
+    pub fn seek_track(&self, track_id: i64, position_secs: f64) {
+        let _ = self.send(EngineCommand::SeekTrack {
+            track_id,
+            position_secs,
+        });
     }
     /// Seeks the current track `secs` seconds forward or backward from the
     /// playhead — the position the listener is actually hearing, as reported

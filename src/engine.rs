@@ -58,6 +58,11 @@ pub enum EngineCommand {
         position_secs: f64,
         playing: bool,
     },
+    RefreshTrack {
+        track_id: i64,
+        position_secs: f64,
+        playing: bool,
+    },
     /// Plays an already-connected station. The HTTP round trip happens in the
     /// command layer on Tauri's async runtime, so the engine thread only ever
     /// receives a reader that is ready to decode.
@@ -82,6 +87,10 @@ pub enum EngineCommand {
     Previous,
     JumpTo(usize),
     Seek(f64),
+    SeekTrack {
+        track_id: i64,
+        position_secs: f64,
+    },
     /// A seek relative to the playhead: `secs` (a magnitude) in `direction`,
     /// clamped to the track.
     SeekBy {
@@ -181,6 +190,8 @@ struct Boundary {
     /// join the two are up to a ring-buffer apart, and applying it early
     /// would play the tail of the outgoing track at the next track's volume.
     gain_db: f64,
+    /// Consumed once, when this discontinuity reaches the device.
+    seeked: Option<(i64, f64)>,
 }
 
 /// An A–B loop on the current track. Detected at the decoder, not at the
@@ -258,6 +269,7 @@ struct PendingCurrent {
     position_secs: f64,
     attempts_left: usize,
     purpose: OpenPurpose,
+    notify_seek: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -308,6 +320,8 @@ pub struct Engine {
     pending_pause: bool,
 
     decoder: Option<Decoder>,
+    /// Identity of the last installed local decoder, retained across a reopen.
+    decoder_track_id: Option<i64>,
     /// Opened early so a gapless transition costs no probe or allocation.
     preloaded: Option<Decoder>,
     preloaded_entry: Option<QueueEntry>,
@@ -404,6 +418,7 @@ impl Engine {
             analyser: None,
             pending_pause: false,
             decoder: None,
+            decoder_track_id: None,
             preloaded: None,
             preloaded_entry: None,
             preloading: None,
@@ -475,6 +490,7 @@ impl Engine {
                         pending.attempts_left,
                         pending.purpose,
                         pending.position_secs,
+                        pending.notify_seek,
                     );
                 }
             }
@@ -483,6 +499,15 @@ impl Engine {
                 playing,
             } => {
                 self.refresh_current(position_secs, playing);
+            }
+            EngineCommand::RefreshTrack {
+                track_id,
+                position_secs,
+                playing,
+            } => {
+                if self.matches_track(track_id) {
+                    self.refresh_current(position_secs, playing);
+                }
             }
             EngineCommand::LoadQueue { entries, index } => {
                 self.finish_measuring(false);
@@ -573,6 +598,14 @@ impl Engine {
             }
             EngineCommand::Seek(secs) => {
                 self.seek(secs);
+            }
+            EngineCommand::SeekTrack {
+                track_id,
+                position_secs,
+            } => {
+                if self.matches_track(track_id) {
+                    self.seek(position_secs);
+                }
             }
             EngineCommand::SeekBy { secs, direction } => self.seek_by(secs, direction),
             EngineCommand::SetLoop {
@@ -728,7 +761,7 @@ impl Engine {
                         // device.
                         self.pending_out.clear();
                         if self.decoder.is_some() && self.mode == Mode::Local {
-                            self.seek(position);
+                            self.seek_internal(position, false);
                         }
                         // `output::build` returns a stopped stream and no
                         // other path starts it here (`set_playing` would
@@ -1024,6 +1057,7 @@ impl Engine {
         self.has_provider = false;
         self.station_epoch.fetch_add(1, Ordering::Relaxed);
         self.decoder = None;
+        self.decoder_track_id = None;
         self.preloaded = None;
         self.preloaded_entry = None;
         self.preloading = None;
@@ -1056,8 +1090,26 @@ impl Engine {
         }
     }
 
-    /// Returns whether the seek landed (an error has been emitted otherwise).
+    /// Check before cancelling a crossfade: its cursor already points at the
+    /// incoming entry, but a seek still acts on the outgoing decoder.
+    fn matches_track(&self, track_id: i64) -> bool {
+        if self.mode != Mode::Local {
+            return false;
+        }
+        if self.transition.is_some() {
+            return self.decoder_track_id == Some(track_id);
+        }
+        self.queue
+            .current()
+            .is_some_and(|entry| entry.track_id == track_id)
+    }
+
+    /// Returns whether the seek landed or a pending open accepted the target.
     fn seek(&mut self, secs: f64) -> bool {
+        self.seek_internal(secs, true)
+    }
+
+    fn seek_internal(&mut self, secs: f64, notify: bool) -> bool {
         if self.mode != Mode::Local {
             return false;
         }
@@ -1071,7 +1123,7 @@ impl Engine {
                 return false;
             }
             self.finish_measuring(false);
-            self.open_current(pending.attempts_left, pending.purpose, secs);
+            self.open_current(pending.attempts_left, pending.purpose, secs, notify);
             self.emit_progress_now();
             return true;
         }
@@ -1107,7 +1159,11 @@ impl Engine {
                     duration_secs: self.current_duration,
                     gain_db: self.current_gain_db,
                     offset_secs: 0.0,
+                    seeked: None,
                 });
+                if notify {
+                    self.emit_seeked(landed);
+                }
                 self.emit_progress_now();
                 true
             }
@@ -1115,6 +1171,15 @@ impl Engine {
                 self.emit(EngineEvent::Error { message });
                 false
             }
+        }
+    }
+
+    fn emit_seeked(&self, position_secs: f64) {
+        if let Some(entry) = self.queue.current().filter(|_| self.mode == Mode::Local) {
+            self.emit(EngineEvent::Seeked {
+                track_id: entry.track_id,
+                position_secs,
+            });
         }
     }
 
@@ -1262,6 +1327,7 @@ impl Engine {
             duration_secs: self.current_duration,
             gain_db: self.current_gain_db,
             offset_secs: landed,
+            seeked: self.queue.current().map(|entry| (entry.track_id, landed)),
         });
         self.emit_loop();
     }
@@ -1279,11 +1345,17 @@ impl Engine {
         self.boundaries.clear();
         self.params.request_flush();
         self.playing = true;
-        self.open_current(self.queue.len(), OpenPurpose::Start, 0.0);
+        self.open_current(self.queue.len(), OpenPurpose::Start, 0.0, false);
     }
 
     /// Carries the one-pass failure bound across asynchronous opens as well.
-    fn open_current(&mut self, mut attempts: usize, purpose: OpenPurpose, position: f64) {
+    fn open_current(
+        &mut self,
+        mut attempts: usize,
+        purpose: OpenPurpose,
+        position: f64,
+        mut notify_seek: bool,
+    ) {
         loop {
             let Some(entry) = self.queue.current().cloned() else {
                 self.stop();
@@ -1308,13 +1380,14 @@ impl Engine {
                     position_secs: position,
                     attempts_left: attempts,
                     purpose,
+                    notify_seek,
                 });
                 self.emit_state();
                 return;
             }
             match self.open_entry(&entry) {
                 Ok(decoder) => {
-                    self.accept_current(decoder, entry, purpose, position);
+                    self.accept_current(decoder, entry, purpose, position, notify_seek);
                     return;
                 }
                 Err(message) => {
@@ -1324,6 +1397,7 @@ impl Engine {
                         self.stop();
                         return;
                     }
+                    notify_seek = false;
                 }
             }
         }
@@ -1356,6 +1430,7 @@ impl Engine {
                 pending.entry,
                 pending.purpose,
                 opened.position_secs,
+                pending.notify_seek,
             ),
             Err(message) => {
                 self.emit(EngineEvent::Error { message });
@@ -1368,7 +1443,7 @@ impl Engine {
                     if attempts == 0 || self.queue.advance().is_none() {
                         self.stop();
                     } else {
-                        self.open_current(attempts, pending.purpose, 0.0);
+                        self.open_current(attempts, pending.purpose, 0.0, false);
                     }
                 }
             }
@@ -1382,6 +1457,7 @@ impl Engine {
         entry: QueueEntry,
         purpose: OpenPurpose,
         position: f64,
+        notify_seek: bool,
     ) {
         // Natural handovers already own output. Initial opens create it only
         // after a decoder is ready.
@@ -1406,6 +1482,13 @@ impl Engine {
                 position,
                 matches!(purpose, OpenPurpose::Refresh),
             );
+        }
+        if notify_seek {
+            // An explicit seek supersedes any pending same-track restart.
+            if let Some(boundary) = self.boundaries.back_mut() {
+                boundary.seeked = None;
+            }
+            self.emit_seeked(position);
         }
         if matches!(purpose, OpenPurpose::Refresh) || position > 0.0 {
             self.finish_measuring(false);
@@ -1439,12 +1522,13 @@ impl Engine {
             duration_secs: self.current_duration,
             gain_db: self.current_gain_db,
             offset_secs: position,
+            seeked: None,
         });
         self.playing = playing;
         if !playing {
             self.fade_then_pause();
         }
-        self.open_current(1, OpenPurpose::Refresh, position);
+        self.open_current(1, OpenPurpose::Refresh, position, true);
         self.emit_progress_now();
     }
 
@@ -1491,6 +1575,13 @@ impl Engine {
         position: f64,
         preserve_identity: bool,
     ) {
+        let track_id = self
+            .queue
+            .current()
+            .filter(|_| self.mode == Mode::Local)
+            .map(|entry| entry.track_id);
+        let restart = !preserve_identity && track_id.is_some() && self.decoder_track_id == track_id;
+        self.decoder_track_id = track_id;
         // Defensive: every caller already clears this on its own path, but
         // a decoder swap and a crossfade cannot coexist.
         self.transition = None;
@@ -1524,6 +1615,7 @@ impl Engine {
             duration_secs: self.current_duration,
             gain_db: self.current_gain_db,
             offset_secs: position,
+            seeked: track_id.filter(|_| restart).map(|id| (id, position)),
         });
 
         self.emit(EngineEvent::Format {
@@ -1963,6 +2055,8 @@ impl Engine {
         self.chain.adopt_timeline();
         self.pending_out = transition.pending_in;
         self.current_duration = transition.duration_secs;
+        let restart = self.decoder_track_id == Some(transition.entry.track_id);
+        self.decoder_track_id = Some(transition.entry.track_id);
 
         // See `Transition`'s doc comment: the mix carried no gain of its
         // own, so this boundary is what hands normalization back to the
@@ -1973,6 +2067,7 @@ impl Engine {
             duration_secs: self.current_duration,
             gain_db: transition.entry.gain_db,
             offset_secs: 0.0,
+            seeked: restart.then_some((transition.entry.track_id, 0.0)),
         });
 
         if let Some(format) = self.decoder.as_ref().map(|d| d.format().clone()) {
@@ -1994,6 +2089,7 @@ impl Engine {
     fn cancel_transition(&mut self) {
         if let Some(transition) = self.transition.take() {
             self.queue.jump_to(transition.outgoing_index);
+            self.emit_state();
         }
     }
 
@@ -2054,14 +2150,18 @@ impl Engine {
                 position_secs: 0.0,
                 attempts_left: self.queue.len(),
                 purpose: OpenPurpose::Advance,
+                notify_seek: false,
             });
         } else {
-            self.open_current(self.queue.len(), OpenPurpose::Advance, 0.0);
+            self.open_current(self.queue.len(), OpenPurpose::Advance, 0.0, false);
         }
     }
 
     /// Keeps the ring and its timeline intact at a natural queue boundary.
     fn install_joined_decoder(&mut self, decoder: Decoder, gain_db: f64) {
+        let track_id = self.queue.current().map(|entry| entry.track_id);
+        let restart = track_id.is_some() && self.decoder_track_id == track_id;
+        self.decoder_track_id = track_id;
         let format = decoder.format().clone();
         self.retune_resampler_for_join(format.sample_rate);
         self.decoder = Some(decoder);
@@ -2076,6 +2176,7 @@ impl Engine {
             duration_secs: self.current_duration,
             gain_db,
             offset_secs: 0.0,
+            seeked: track_id.filter(|_| restart).map(|id| (id, 0.0)),
         });
         self.emit(EngineEvent::Format {
             sample_rate: format.sample_rate,
@@ -2210,6 +2311,16 @@ impl Engine {
         // makes the UI flip at the moment the listener hears the new track.
         let played = self.params.frames_played();
         while self.boundaries.len() > 1 && self.boundaries[1].frame <= played {
+            if let Some((track_id, position_secs)) = self
+                .boundaries
+                .front_mut()
+                .and_then(|boundary| boundary.seeked.take())
+            {
+                self.emit(EngineEvent::Seeked {
+                    track_id,
+                    position_secs,
+                });
+            }
             self.boundaries.pop_front();
         }
         // The timeline only ever gets looked up at `played` and at the
@@ -2232,7 +2343,22 @@ impl Engine {
                 // across the buffer, so the change is inaudible.
                 self.apply_gain(gain_db);
                 self.emit(EngineEvent::TrackChanged { index });
+                // Decode can already be several short tracks ahead. Keep the
+                // announced identity at this audible boundary, but capabilities
+                // still describe what a command can execute at the queue cursor.
+                self.emit_state_at(index);
             }
+        }
+        if let Some((track_id, position_secs)) = self
+            .boundaries
+            .front_mut()
+            .filter(|boundary| boundary.frame <= played)
+            .and_then(|boundary| boundary.seeked.take())
+        {
+            self.emit(EngineEvent::Seeked {
+                track_id,
+                position_secs,
+            });
         }
 
         self.emit_stream_metadata();
@@ -2296,13 +2422,18 @@ impl Engine {
     }
 
     fn emit_state(&self) {
+        self.emit_state_at(self.queue.index());
+    }
+
+    fn emit_state_at(&self, index: usize) {
         self.emit(EngineEvent::State {
             playing: self.playing,
             mode: self.mode,
-            index: self.queue.index(),
+            index,
             queue_len: self.queue.len(),
             shuffle: self.queue.shuffle(),
             repeat: self.queue.repeat(),
+            has_next: self.mode == Mode::Local && self.queue.peek_next().is_some(),
             station_id: self.station_id.clone(),
         });
     }
@@ -2715,10 +2846,16 @@ mod tests {
             "a full initial listen is being measured"
         );
 
-        engine.handle(EngineCommand::RefreshCurrent {
+        sink.0.lock().unwrap().clear();
+        engine.handle(EngineCommand::RefreshTrack {
+            track_id: entry.track_id,
             position_secs: 0.5,
             playing: false,
         });
+        assert!(
+            seeked_events(&sink).is_empty(),
+            "opening is not a confirmation"
+        );
         until(|| {
             engine.poll_current();
             engine.pending_current.is_none()
@@ -2728,7 +2865,21 @@ mod tests {
             .as_ref()
             .expect("refresh installed its decoder");
         assert!((decoder.position_secs() - 0.5).abs() < 0.01);
+        let landed = decoder.position_secs();
+        assert_eq!(seeked_events(&sink), vec![(entry.track_id, landed)]);
         engine.emit_progress_now();
+        engine.emit_progress_now();
+        assert_eq!(seeked_events(&sink), vec![(entry.track_id, landed)]);
+        {
+            let events = sink.0.lock().unwrap();
+            let confirmation = events
+                .iter()
+                .position(|event| matches!(event, EngineEvent::Seeked { .. }))
+                .unwrap();
+            assert!(events[confirmation + 1..]
+                .iter()
+                .any(|event| { matches!(event, EngineEvent::Position { .. }) }));
+        }
         assert!(!engine.playing);
         assert!((engine.position_secs() - 0.5).abs() < 0.01);
         assert_eq!(engine.reported_index, Some(0));
@@ -4146,6 +4297,7 @@ mod tests {
             duration_secs: 10.0,
             gain_db: 0.0,
             offset_secs: 0.0,
+            seeked: None,
         });
         engine.boundaries.push_back(Boundary {
             frame: 1000,
@@ -4153,6 +4305,7 @@ mod tests {
             duration_secs: 20.0,
             gain_db: -3.0,
             offset_secs: 0.0,
+            seeked: None,
         });
 
         engine.params.reset_frames(999);
@@ -4543,5 +4696,435 @@ mod tests {
         assert!(!engine.playing);
         assert_eq!(engine.position_secs(), 0.5);
         assert_eq!(engine.queue.index(), 0);
+    }
+
+    fn seeked_events(sink: &CaptureSink) -> Vec<(i64, f64)> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Seeked {
+                    track_id,
+                    position_secs,
+                } => Some((*track_id, *position_secs)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transport_state_reports_the_actual_shuffled_successor() {
+        let (mut engine, sink) = captured_engine();
+        engine.queue.load(missing_entries(5), 0);
+        engine.queue.set_shuffle(true);
+        engine.mode = Mode::Local;
+        for _ in 0..engine.queue.len() - 1 {
+            engine.emit_state();
+            assert!(matches!(
+                sink.0.lock().unwrap().last(),
+                Some(EngineEvent::State { has_next: true, .. })
+            ));
+            engine.queue.advance().unwrap();
+        }
+        assert!(engine.queue.peek_next().is_none());
+        engine.emit_state();
+        assert!(matches!(
+            sink.0.lock().unwrap().last(),
+            Some(EngineEvent::State {
+                has_next: false,
+                ..
+            })
+        ));
+        engine.queue.set_repeat(true);
+        engine.emit_state();
+        assert!(matches!(
+            sink.0.lock().unwrap().last(),
+            Some(EngineEvent::State { has_next: true, .. })
+        ));
+        for mode in [Mode::Radio, Mode::Idle] {
+            engine.mode = mode;
+            engine.emit_state();
+            assert!(matches!(
+                sink.0.lock().unwrap().last(),
+                Some(EngineEvent::State {
+                    has_next: false,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn seeks_report_only_confirmed_landings_with_the_queue_identity() {
+        let (mut engine, sink) = captured_engine();
+        engine.queue.load(missing_entries(1), 0);
+        let tone = engine_with_tone(3);
+        engine.mode = Mode::Local;
+        engine.current_duration = tone.current_duration;
+        engine.decoder = tone.decoder;
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 0,
+            position_secs: 0.51234,
+        });
+        let landed = engine.decoder.as_ref().unwrap().position_secs();
+        assert_eq!(seeked_events(&sink), vec![(0, landed)]);
+        assert!((landed - 0.51234).abs() < 1.0 / 44_100.0);
+        {
+            let events = sink.0.lock().unwrap();
+            let confirmation = events
+                .iter()
+                .position(|event| matches!(event, EngineEvent::Seeked { .. }))
+                .unwrap();
+            let progress = events
+                .iter()
+                .position(|event| matches!(event, EngineEvent::Position { .. }))
+                .unwrap();
+            assert!(confirmation < progress);
+        }
+        sink.0.lock().unwrap().clear();
+        engine.seek_by(0.25, SeekDirection::Forward);
+        let landed = engine.decoder.as_ref().unwrap().position_secs();
+        assert_eq!(seeked_events(&sink), vec![(0, landed)]);
+        sink.0.lock().unwrap().clear();
+        assert!(!engine.seek(f64::INFINITY));
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 999,
+            position_secs: 1.0,
+        });
+        engine.emit_progress_now();
+        engine.emit_progress_now();
+        assert!(seeked_events(&sink).is_empty());
+        engine.mode = Mode::Radio;
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 0,
+            position_secs: 1.0,
+        });
+        assert!(seeked_events(&sink).is_empty());
+    }
+
+    #[test]
+    fn next_then_stale_set_position_does_not_seek_the_new_track() {
+        let (mut engine, sink) = captured_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine.queue.load(
+            vec![deferred_entry(1, "first"), deferred_entry(2, "second")],
+            0,
+        );
+        engine.mode = Mode::Local;
+        engine.handle(EngineCommand::Next);
+        let pending = next_resolve(&calls);
+        assert_eq!(pending.id, "second");
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 1,
+            position_secs: 0.5,
+        });
+        engine.handle(EngineCommand::RefreshTrack {
+            track_id: 1,
+            position_secs: 0.5,
+            playing: false,
+        });
+        assert_eq!(engine.pending_current.as_ref().unwrap().position_secs, 0.0);
+        assert!(
+            calls.try_recv().is_err(),
+            "stale seek must not reopen the source"
+        );
+        assert!(seeked_events(&sink).is_empty());
+        engine.stop();
+        assert_cancelled(pending.reply);
+    }
+
+    #[test]
+    fn a_pending_open_confirms_a_seek_only_after_native_positioning() {
+        let (path, entry) = wav_track(7, "audio-stack-seek-confirmation");
+        let (mut engine, sink) = captured_engine();
+        engine.mode = Mode::Local;
+        engine.queue.load(vec![entry], 0);
+        // Advance owns its output already; this exercises the real opener
+        // and installer without constructing an audio device.
+        engine.open_current(1, OpenPurpose::Advance, 0.1, false);
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 7,
+            position_secs: 0.51234,
+        });
+        assert!(
+            seeked_events(&sink).is_empty(),
+            "accepting a target is not success"
+        );
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        let landed = engine.decoder.as_ref().unwrap().position_secs();
+        assert!((landed - 0.51234).abs() < 1.0 / 44_100.0);
+        assert_eq!(seeked_events(&sink), vec![(7, landed)]);
+        engine.emit_progress_now();
+        engine.emit_progress_now();
+        assert_eq!(seeked_events(&sink), vec![(7, landed)]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_deferred_seek_never_confirms() {
+        let (mut engine, sink) = captured_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine.mode = Mode::Local;
+        engine.queue.load(vec![deferred_entry(8, "cancelled")], 0);
+        engine.open_current(1, OpenPurpose::Advance, 0.0, false);
+        let initial = next_resolve(&calls);
+        engine.seek(0.5);
+        let sought = next_resolve(&calls);
+        assert_cancelled(initial.reply);
+        assert!(seeked_events(&sink).is_empty());
+        engine.stop();
+        assert_cancelled(sought.reply);
+        assert!(!engine.poll_current());
+        assert!(seeked_events(&sink).is_empty());
+
+        engine.mode = Mode::Local;
+        engine.open_current(1, OpenPurpose::Advance, 0.0, false);
+        let initial = next_resolve(&calls);
+        engine.seek(0.5);
+        let sought = next_resolve(&calls);
+        assert_cancelled(initial.reply);
+        sought.reply.send(Err("not playable".to_owned())).unwrap();
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        assert_eq!(engine.mode, Mode::Idle);
+        assert!(seeked_events(&sink).is_empty());
+    }
+
+    #[test]
+    fn same_identity_restarts_confirm_once_and_ticks_do_not() {
+        let (mut engine, sink) = captured_engine();
+        engine.queue.load(missing_entries(1), 0);
+        engine.mode = Mode::Local;
+        let tone = engine_with_tone(3);
+        engine.install_decoder(tone.decoder.unwrap(), 0.0);
+        engine.emit_progress_now();
+        assert!(
+            seeked_events(&sink).is_empty(),
+            "initial load is not a seek"
+        );
+        let tone = engine_with_tone(3);
+        engine.install_decoder(tone.decoder.unwrap(), 0.0);
+        assert!(
+            seeked_events(&sink).is_empty(),
+            "wait for the audible origin"
+        );
+        engine.emit_progress_now();
+        engine.emit_progress_now();
+        assert_eq!(seeked_events(&sink), vec![(0, 0.0)]);
+        sink.0.lock().unwrap().clear();
+        let tone = engine_with_tone(3);
+        engine.install_decoder_at(tone.decoder.unwrap(), 0.0, 0.5, true);
+        engine.emit_progress_now();
+        assert!(
+            seeked_events(&sink).is_empty(),
+            "installation alone is not a seek"
+        );
+    }
+
+    #[test]
+    fn a_one_item_repeat_confirms_only_when_the_join_becomes_audible() {
+        let (mut engine, sink) = captured_engine();
+        let entry = missing_entries(1).remove(0);
+        engine.queue.load(vec![entry.clone()], 0);
+        engine.queue.set_repeat(true);
+        engine.mode = Mode::Local;
+        let tone = engine_with_tone(3);
+        engine.install_decoder(tone.decoder.unwrap(), 0.0);
+        engine.emit_progress_now();
+        engine.frames_written = 128;
+        let tone = engine_with_tone(3);
+        engine.preloaded = tone.decoder;
+        engine.preloaded_entry = Some(entry);
+        engine.advance_or_stop();
+        engine.params.reset_frames(127);
+        engine.emit_progress_now();
+        assert!(seeked_events(&sink).is_empty());
+        engine.params.reset_frames(128);
+        engine.emit_progress_now();
+        engine.params.reset_frames(129);
+        engine.emit_progress_now();
+        assert_eq!(seeked_events(&sink), vec![(0, 0.0)]);
+    }
+
+    #[test]
+    fn natural_advance_updates_has_next_only_at_the_audible_boundary() {
+        let (mut engine, sink) = captured_engine();
+        engine.queue.load(missing_entries(3), 0);
+        engine.mode = Mode::Local;
+        let tone = engine_with_tone(3);
+        engine.install_decoder(tone.decoder.unwrap(), 0.0);
+        engine.emit_progress_now();
+        sink.0.lock().unwrap().clear();
+        for frame in [128, 256] {
+            engine.frames_written = frame;
+            engine.preloaded = engine_with_tone(3).decoder;
+            engine.preloaded_entry = engine.queue.peek_next().cloned();
+            engine.advance_or_stop();
+        }
+        assert_eq!(engine.queue.index(), 2, "decode is two tracks ahead");
+        engine.params.reset_frames(127);
+        engine.emit_progress_now();
+        assert!(!sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| { matches!(event, EngineEvent::State { .. }) }));
+        engine.params.reset_frames(128);
+        engine.emit_progress_now();
+        {
+            let events = sink.0.lock().unwrap();
+            let changed = events
+                .iter()
+                .position(|event| matches!(event, EngineEvent::TrackChanged { index: 1 }))
+                .unwrap();
+            assert!(matches!(
+                events.get(changed + 1),
+                Some(EngineEvent::State {
+                    index: 1,
+                    has_next: false,
+                    ..
+                })
+            ));
+        }
+        sink.0.lock().unwrap().clear();
+        engine.params.reset_frames(256);
+        engine.emit_progress_now();
+        let events = sink.0.lock().unwrap();
+        let changed = events
+            .iter()
+            .position(|event| matches!(event, EngineEvent::TrackChanged { index: 2 }))
+            .unwrap();
+        assert!(matches!(
+            events.get(changed + 1),
+            Some(EngineEvent::State {
+                index: 2,
+                has_next: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guarded_refresh_waits_for_success_and_never_confirms_failure_or_cancellation() {
+        let (mut engine, sink) = captured_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine.mode = Mode::Local;
+        engine.queue.load(vec![deferred_entry(9, "refresh")], 0);
+        engine.handle(EngineCommand::RefreshTrack {
+            track_id: 9,
+            position_secs: 0.5,
+            playing: false,
+        });
+        let failed = next_resolve(&calls);
+        assert!(engine.pending_current.as_ref().unwrap().notify_seek);
+        assert!(seeked_events(&sink).is_empty());
+        failed
+            .reply
+            .send(Err("refresh unavailable".to_owned()))
+            .unwrap();
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        assert!(!engine.playing);
+        assert!(seeked_events(&sink).is_empty());
+        engine.handle(EngineCommand::RefreshTrack {
+            track_id: 9,
+            position_secs: 0.75,
+            playing: false,
+        });
+        let cancelled = next_resolve(&calls);
+        engine.stop();
+        assert_cancelled(cancelled.reply);
+        assert!(!engine.poll_current());
+        assert!(seeked_events(&sink).is_empty());
+    }
+
+    #[test]
+    fn guarded_transport_checks_the_outgoing_crossfade_identity_before_cancelling() {
+        let (mut engine, _consumer, path0, path1) =
+            crossfading_engine("audio-stack-guarded-crossfade");
+        let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
+        engine.sink = sink.clone();
+        engine.decoder_track_id = Some(0);
+        assert!(engine.maybe_start_transition());
+        assert_eq!(engine.queue.current().unwrap().track_id, 1);
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 1,
+            position_secs: 0.25,
+        });
+        engine.handle(EngineCommand::RefreshTrack {
+            track_id: 1,
+            position_secs: 0.25,
+            playing: false,
+        });
+        assert!(
+            engine.transition.is_some(),
+            "stale guards must not mutate playback"
+        );
+        assert!(seeked_events(&sink).is_empty());
+        engine.handle(EngineCommand::SeekTrack {
+            track_id: 0,
+            position_secs: 0.25,
+        });
+        assert!(engine.transition.is_none());
+        assert_eq!(engine.queue.current().unwrap().track_id, 0);
+        let landed = engine.decoder.as_ref().unwrap().position_secs();
+        assert_eq!(seeked_events(&sink), vec![(0, landed)]);
+        assert!((landed - 0.25).abs() < 1.0 / 44_100.0);
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+    }
+
+    #[test]
+    fn cancelling_a_crossfade_republishes_the_restored_successor() {
+        for command in [
+            EngineCommand::SetCrossfade(false),
+            EngineCommand::Seek(f64::INFINITY),
+            EngineCommand::JumpTo(usize::MAX),
+        ] {
+            let (mut engine, _consumer, path0, path1) =
+                crossfading_engine("audio-stack-cancelled-crossfade-state");
+            let sink = Arc::new(CaptureSink(std::sync::Mutex::new(Vec::new())));
+            engine.sink = sink.clone();
+            engine.decoder_track_id = Some(0);
+            assert!(engine.maybe_start_transition());
+            engine.emit_state();
+            assert!(matches!(
+                sink.0.lock().unwrap().last(),
+                Some(EngineEvent::State {
+                    index: 1,
+                    has_next: false,
+                    ..
+                })
+            ));
+            sink.0.lock().unwrap().clear();
+            engine.handle(command);
+            assert!(engine.transition.is_none());
+            assert_eq!(engine.queue.index(), 0);
+            assert!(sink.0.lock().unwrap().iter().any(|event| {
+                matches!(
+                    event,
+                    EngineEvent::State {
+                        index: 0,
+                        has_next: true,
+                        ..
+                    }
+                )
+            }));
+            assert!(seeked_events(&sink).is_empty());
+            let _ = std::fs::remove_file(path0);
+            let _ = std::fs::remove_file(path1);
+        }
     }
 }

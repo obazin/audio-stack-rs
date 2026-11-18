@@ -192,6 +192,28 @@ If refresh fails, playback stays paused at the requested position.
 Superseded opens cancel pending resolution and discard late decoder results.
 `read_overview` uses the same resolver independently of playback.
 
+`EngineEvent::State.has_next` (`hasNext` in JSON) is the engine's authoritative
+local-queue successor check, including the shuffled cursor and repeat. It is
+false for idle/radio playback; hosts must not infer it from the displayed index.
+
+`engine.seek_track(track_id, position_secs)` and
+`engine.refresh_track(track_id, position_secs, playing)` queue
+identity-guarded operations: the engine thread ignores them if local playback
+no longer has that track id. During a crossfade the outgoing decoder is the
+target; a stale guard never cancels the fade or seeks the incoming track.
+The existing `seek`, `seek_by`, and `refresh_current` methods remain unguarded.
+`EngineEvent::Seeked { track_id, position_secs }` (`seeked`, `trackId`,
+`positionSecs` in JSON) confirms the actual decoder landing, never merely the
+requested target. Deferred opens confirm only after successful installation;
+failed, superseded, or stale requests do not confirm. Explicit confirmations
+precede the next `Position`; ordinary progress and device changes do not
+generate them. A successful source refresh confirms its installed position,
+even when it reanchors the same logical playhead point. An explicit same-track
+restart confirms the installed reset to zero even while paused; it does not wait
+for playback to resume. Natural queued repeats and A–B loop jumps instead wait
+until their in-ring boundary reaches the device. Each confirmation precedes the
+corresponding `Position`. Events carry stable ids, not source URLs.
+
 Metadata parsing is standalone — no engine required:
 
 ```rust
@@ -199,7 +221,7 @@ let meta  = audio_stack_rs::read_metadata(std::path::Path::new("/music/track.fla
 let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>, base64 data URL parts
 ```
 
-`AudioEngine` methods (`load_queue`, `set_source_resolver`, `refresh_current`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `seek_by`, `set_loop`/`clear_loop`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for network tasks and deferred resolution; native probing and decoding stay on blocking workers or the engine thread, never the realtime callback.
+`AudioEngine` methods (`load_queue`, `set_source_resolver`, `refresh_current`, `refresh_track`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `seek_track`, `seek_by`, `set_loop`/`clear_loop`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for network tasks and deferred resolution; native probing and decoding stay on blocking workers or the engine thread, never the realtime callback.
 
 ## Architecture notes
 

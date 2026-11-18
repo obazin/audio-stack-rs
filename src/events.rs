@@ -53,6 +53,8 @@ pub enum EngineEvent {
         shuffle: bool,
         /// Whether queue repeat is on.
         repeat: bool,
+        /// Whether local playback can advance, honoring shuffle and repeat.
+        has_next: bool,
         /// The station id, when `mode` is [`Mode::Radio`].
         station_id: Option<String>,
     },
@@ -74,6 +76,17 @@ pub enum EngineEvent {
         position_secs: f64,
         /// Zero for radio, which has no end.
         duration_secs: f64,
+    },
+    /// A confirmed local playhead discontinuity, not an ordinary position tick.
+    /// Explicit seeks, refreshes and restarts confirm the installed position,
+    /// including while paused. Natural repeats and A–B loops confirm when
+    /// their boundary reaches the device.
+    #[serde(rename_all = "camelCase")]
+    Seeked {
+        /// Stable queue identity; never a source address.
+        track_id: i64,
+        /// Actual landing position in source seconds.
+        position_secs: f64,
     },
     /// The queue moved on — including a gapless transition, which is emitted
     /// when the boundary actually reaches the device rather than when the
@@ -232,11 +245,25 @@ mod tests {
             queue_len: 10,
             shuffle: false,
             repeat: true,
+            has_next: true,
             station_id: None,
         });
         assert!(encoded.contains(r#""queueLen":10"#), "{encoded}");
+        assert!(encoded.contains(r#""hasNext":true"#), "{encoded}");
         assert!(encoded.contains(r#""stationId":null"#), "{encoded}");
         assert!(encoded.contains(r#""mode":"local""#), "{encoded}");
+    }
+
+    #[test]
+    fn seeked_fields_are_tagged_and_camel_cased() {
+        let encoded = json(&EngineEvent::Seeked {
+            track_id: 42,
+            position_secs: 1.25,
+        });
+        assert_eq!(
+            encoded,
+            r#"{"event":"seeked","data":{"trackId":42,"positionSecs":1.25}}"#
+        );
     }
 
     #[cfg(feature = "stretch")]
